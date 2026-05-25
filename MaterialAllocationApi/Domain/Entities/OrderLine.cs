@@ -19,7 +19,7 @@ public class OrderLine
     }
 
     // Called by the allocation service(Phase 4) inside the allocation transaction
-    public void Allocated(int quantity)
+    public void Allocate(int quantity)
     {
         if(quantity <= 0)
             throw new ArgumentOutOfRangeException(nameof(quantity), "Allocation quantity must be positive.");

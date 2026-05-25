@@ -21,6 +21,7 @@ builder.Services.AddDbContext<AllocationDbContext>(options => options.UseNpgsql(
 builder.Services.AddScoped<IDbConnectionFactory, NpgsqlConnectionFactory>();
 builder.Services.AddScoped<ISkuService, SkuService>();
 builder.Services.AddScoped<IOrderService, OrderService>();
+builder.Services.AddScoped<IAllocationService, AllocationService>();
 
 builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();

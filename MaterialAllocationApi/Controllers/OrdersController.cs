@@ -5,10 +5,12 @@ using Microsoft.AspNetCore.Mvc;
 public class OrdersController : ControllerBase
 {
     private readonly IOrderService _orders;
+    private readonly IAllocationService _allocation;
 
-    public OrdersController(IOrderService orders)
+    public OrdersController(IOrderService orders, IAllocationService allocation)
     {
         _orders = orders;
+        _allocation = allocation;
     }
 
     /// <summary>Create an order with one or more lines referencing existing SKUs.</summary>
@@ -70,5 +72,24 @@ public class OrdersController : ControllerBase
         var order = await _orders.CancelAsync(id, ct);
 
         return Ok(ApiResponse<OrderResponse>.Ok(order));
+    }
+
+    /// <summary>
+    /// Allocate available stock to open order lines.
+    /// Lines are filled in sku_id order against current on_hand.
+    /// Partial allocation is allowed: unfulfilled lines appear with remainingQty > 0.
+    /// Returns 409 if the order is cancelled or already fully allocated.
+    /// </summary>
+    /// <response code="200">Allocation applied; response shows partial or full result.</response>
+    /// <response code="404">No order with the given ID exists.</response>
+    /// <response code="409">Order is cancelled or already fully allocated.</response>
+    [HttpPost("{id:guid}/allocate")]
+    [ProducesResponseType(typeof(ApiResponse<AllocationResponse>), StatusCodes.Status200OK)]
+    [ProducesResponseType(typeof(ApiResponse<object>), StatusCodes.Status404NotFound)]
+    [ProducesResponseType(typeof(ApiResponse<object>), StatusCodes.Status409Conflict)]
+    public async Task<ActionResult<ApiResponse<AllocationResponse>>> Allocate(Guid id, CancellationToken ct)
+    {
+        var result = await _allocation.AllocateAsync(id, ct);
+        return Ok(ApiResponse<AllocationResponse>.Ok(result));
     }
 }

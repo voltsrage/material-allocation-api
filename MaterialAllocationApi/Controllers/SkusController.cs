@@ -5,10 +5,12 @@ using Microsoft.AspNetCore.Mvc;
 public class SkusController : ControllerBase
 {
     private readonly ISkuService _skus;
+    private readonly IAllocationService _allocation;
 
-    public SkusController(ISkuService skus)
+    public SkusController(ISkuService skus, IAllocationService allocation)
     {
         _skus = skus;
+        _allocation = allocation;
     }
 
     /// <summary>Create a new SKU with an initial on-hand quantity.</summary>
@@ -72,5 +74,22 @@ public class SkusController : ControllerBase
     {
         var sku = await _skus.AdjustAsync(id, request, ct);
         return Ok(ApiResponse<SkuResponse>.Ok(sku));
+    }
+
+    /// <summary>
+    /// Return the available quantity for a SKU.
+    /// Formula: available = on_hand - reserved - allocated.
+    /// on_hand is mutable (decremented on allocation), so it already excludes committed allocations.
+    /// Reserved is 0 until Phase 7 adds the reservations table.
+    /// </summary>
+    /// <response code="200">Availability for the given SKU.</response>
+    /// <response code="404">No SKU with the given ID exists.</response>
+    [HttpGet("{id:guid}/availability")]
+    [ProducesResponseType(typeof(ApiResponse<AvailabilityResponse>), StatusCodes.Status200OK)]
+    [ProducesResponseType(typeof(ApiResponse<object>), StatusCodes.Status404NotFound)]
+    public async Task<ActionResult<ApiResponse<AvailabilityResponse>>> GetAvailability(Guid id, CancellationToken ct)
+    {
+        var result = await _allocation.GetAvailabilityAsync(id, ct);
+        return Ok(ApiResponse<AvailabilityResponse>.Ok(result));
     }
 }
