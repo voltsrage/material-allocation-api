@@ -1,0 +1,74 @@
+using Microsoft.AspNetCore.Mvc;
+
+[ApiController]
+[Route("api/v1/orders")]
+public class OrdersController : ControllerBase
+{
+    private readonly IOrderService _orders;
+
+    public OrdersController(IOrderService orders)
+    {
+        _orders = orders;
+    }
+
+    /// <summary>Create an order with one or more lines referencing existing SKUs.</summary>
+    /// <response code="201">Order created.</response>
+    /// <response code="422">Reference code already exists, unknown SKU IDs, duplicate SKU in lines, invalid priority, or requested_qty ≤ 0.</response>
+    [HttpPost]
+    [ProducesResponseType(typeof(ApiResponse<OrderResponse>), StatusCodes.Status201Created)]
+    [ProducesResponseType(typeof(ApiResponse<object>), StatusCodes.Status422UnprocessableEntity)]
+    public async Task<ActionResult<ApiResponse<OrderResponse>>> Create(
+        CreateOrderRequest request, CancellationToken ct
+    )
+    {
+        var order = await _orders.CreateAsync(request, ct);
+
+        return CreatedAtAction(nameof(GetById), new {id = order.Id}, ApiResponse<OrderResponse>.Created(order));
+    }
+
+    /// <summary>Get a full order including all lines and their allocation status.</summary>
+    /// <response code="200">Order found.</response>
+    /// <response code="404">No order with the given ID exists.</response>
+    [HttpGet("{id:guid}")]
+    [ProducesResponseType(typeof(ApiResponse<OrderResponse>), StatusCodes.Status200OK)]
+    [ProducesResponseType(typeof(ApiResponse<object>), StatusCodes.Status404NotFound)]
+    public async Task<ActionResult<ApiResponse<OrderResponse>>> GetById(Guid id, CancellationToken ct)
+    {
+        var order = await _orders.GetByIdAsync(id, ct);
+        return Ok(ApiResponse<OrderResponse>.Ok(order));
+    }
+
+    /// <summary>List orders with optional status filter and pagination.</summary>
+    /// <response code="200">Paginated order summary list.</response>
+    [HttpGet]
+    [ProducesResponseType(typeof(ApiResponse<PagedResult<OrderSummaryResponse>>), StatusCodes.Status200OK)]
+    public async Task<ActionResult<ApiResponse<PagedResult<OrderSummaryResponse>>>> List(
+        [FromQuery] string? status,
+        [FromQuery] int page = 1,
+        [FromQuery] int pageSize = 20,
+        CancellationToken ct = default
+    )
+    {
+        var result = await _orders.ListAsync(status, page, pageSize, ct);
+
+        return Ok(ApiResponse<PagedResult<OrderSummaryResponse>>.Ok(result));
+    }
+
+    /// <summary>
+    /// Cancel an order. Returns the updated order. Returns 409 if already cancelled.
+    /// Phase 6 adds allocation release — in Phase 3, only the status transition is applied.
+    /// </summary>
+    /// <response code="200">Order cancelled.</response>
+    /// <response code="404">No order with the given ID exists.</response>
+    /// <response code="409">Order is already cancelled.</response>
+    [HttpPost("{id:guid}/cancel")]
+    [ProducesResponseType(typeof(ApiResponse<OrderResponse>), StatusCodes.Status200OK)]
+    [ProducesResponseType(typeof(ApiResponse<object>), StatusCodes.Status404NotFound)]
+    [ProducesResponseType(typeof(ApiResponse<object>), StatusCodes.Status409Conflict)]
+    public async Task<ActionResult<ApiResponse<OrderResponse>>>Cancel(Guid id, CancellationToken ct)
+    {
+        var order = await _orders.CancelAsync(id, ct);
+
+        return Ok(ApiResponse<OrderResponse>.Ok(order));
+    }
+}
