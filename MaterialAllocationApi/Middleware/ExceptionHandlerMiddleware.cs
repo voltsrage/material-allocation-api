@@ -32,7 +32,8 @@ public class ExceptionHandlerMiddleware
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Unhandled exception");
+            _logger.LogError(ex, "Unhandled exception on {RequestMethod} {RequestPath}",
+                context.Request.Method, context.Request.Path);
             await WriteAsync(context, 500, ApiResponse<object>.Fail(500, "An unexpected error occurred.", "INTERNAL_ERROR"));
         }
     }

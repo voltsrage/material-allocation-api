@@ -1,91 +1,215 @@
+using System.Reflection;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using MaterialAllocationApi.Common.Middleware;
+using Microsoft.AspNetCore.Diagnostics.HealthChecks;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Diagnostics.HealthChecks;
+using Microsoft.OpenApi;
+using Serilog;
 
-// TIMESTAMPTZ maps to DateTimeOffset in both EF and Dapper. Without this, Npgsql 6+
-// maps it to DateTime(UTC), causing a type mismatch between EF entities and Dapper DTOs.
-AppContext.SetSwitch("Npgsql.EnableLegacyTimestampBehavior", true);
+Log.Logger = new LoggerConfiguration()
+    .WriteTo.Console()
+    .CreateBootstrapLogger();
 
-// Dapper maps snake_case column names (sku_code) to PascalCase C# properties (SkuCode)
-// automatically — no column aliases needed in SQL queries.
-Dapper.DefaultTypeMap.MatchNamesWithUnderscores = true;
-
-var builder = WebApplication.CreateBuilder(args);
-
-builder.Services.Configure<RouteOptions>(o => o.LowercaseUrls = true);
-
-// App runtime uses the restricted role (DML only - no DDL privileges)
-builder.Services.AddDbContext<AllocationDbContext>(options => options.UseNpgsql(builder.Configuration.GetConnectionString("Postgres")));
-
-// Add services to the container.
-
-builder.Services.AddScoped<IDbConnectionFactory, NpgsqlConnectionFactory>();
-builder.Services.AddScoped<ISkuService, SkuService>();
-builder.Services.AddScoped<IOrderService, OrderService>();
-builder.Services.AddScoped<IAllocationService, AllocationService>();
-builder.Services.AddScoped<IReservationService, ReservationService>();
-builder.Services.AddHostedService<ReservationExpiryJob>();
-builder.Services.AddScoped<IRollupService, RollupService>();
-
-builder.Services.AddControllers()
-    .AddJsonOptions(o =>
-        o.JsonSerializerOptions.Converters.Add(
-            new JsonStringEnumConverter(JsonNamingPolicy.SnakeCaseLower)));
-builder.Services.AddEndpointsApiExplorer();
-builder.Services.AddSwaggerGen(c =>
+try
 {
-    c.SwaggerDoc("v1", new() { Title = "Material Allocation API", Version = "v1" });  
-});
+    // TIMESTAMPTZ maps to DateTimeOffset in both EF and Dapper. Without this, Npgsql 6+
+    // maps it to DateTime(UTC), causing a type mismatch between EF entities and Dapper DTOs.
+    AppContext.SetSwitch("Npgsql.EnableLegacyTimestampBehavior", true);
 
-builder.Services.Configure<ApiBehaviorOptions>(options => 
-    options.InvalidModelStateResponseFactory = ctx =>
+    // Dapper maps snake_case column names (sku_code) to PascalCase C# properties (SkuCode)
+    // automatically — no column aliases needed in SQL queries.
+    Dapper.DefaultTypeMap.MatchNamesWithUnderscores = true;
+
+    var builder = WebApplication.CreateBuilder(args);
+
+    builder.Host.UseSerilog((ctx, lc) => lc
+        .ReadFrom.Configuration(ctx.Configuration)
+        .Enrich.FromLogContext()
+        .Enrich.WithMachineName()
+        .Enrich.WithThreadId());
+
+    builder.Services.Configure<RouteOptions>(o => o.LowercaseUrls = true);
+
+    // App runtime uses the restricted role (DML only - no DDL privileges)
+    builder.Services.AddDbContext<AllocationDbContext>(options => options.UseNpgsql(builder.Configuration.GetConnectionString("Postgres")));
+
+    // Add services to the container.
+
+    builder.Services.AddScoped<IDbConnectionFactory, NpgsqlConnectionFactory>();
+    builder.Services.AddScoped<ISkuService, SkuService>();
+    builder.Services.AddScoped<IOrderService, OrderService>();
+    builder.Services.AddScoped<IAllocationService, AllocationService>();
+    builder.Services.AddScoped<IReservationService, ReservationService>();
+    builder.Services.AddHostedService<ReservationExpiryJob>();
+    builder.Services.AddScoped<IRollupService, RollupService>();
+
+    builder.Services.AddControllers()
+        .AddJsonOptions(o =>
+            o.JsonSerializerOptions.Converters.Add(
+                new JsonStringEnumConverter(JsonNamingPolicy.SnakeCaseLower)));
+    builder.Services.AddEndpointsApiExplorer();
+    builder.Services.AddSwaggerGen(options =>
     {
-        var message = ctx.ModelState.Values
-            .SelectMany(v => v.Errors)
-            .Select(e => e.ErrorMessage)
-            .FirstOrDefault() ?? "Validation failed.";
+        options.SwaggerDoc("v1", new OpenApiInfo
+        {
+            Title   = "Material Allocation API",
+            Version = "v1",
+            Description = """
+                Allocates constrained inventory (SKUs) to competing orders under concurrency.
 
-        return new UnprocessableEntityObjectResult(
-            ApiResponse<object>.Fail(422, message, "VALIDATION_ERROR")
+                **Concurrency strategy:** `SELECT ... FOR UPDATE` on SKU rows in ascending `sku_id` order.
+                All operations that touch inventory (allocate, reserve, cancel-release) acquire these locks
+                first, guaranteeing that concurrent requests are serialized at the database layer.
+
+                **Error model:** every non-2xx response returns `ApiResponse<null>` with a machine-readable
+                `error.code` field. Conflict codes: `ORDER_CANCELLED`, `ORDER_FULLY_ALLOCATED`,
+                `ORDER_ALREADY_CANCELLED`, `CONCURRENT_MODIFICATION`. Validation code: `VALIDATION_ERROR`.
+                """
+        });
+
+        // Load the XML file generated by <GenerateDocumentationFile>.
+        var xmlFile = $"{Assembly.GetExecutingAssembly().GetName().Name}.xml";
+        var xmlPath = Path.Combine(AppContext.BaseDirectory, xmlFile);
+        options.IncludeXmlComments(xmlPath);
+
+        // Group operations under their controller tags.
+        options.TagActionsBy(api => [api.GroupName ?? api.ActionDescriptor.RouteValues["controller"]!]); 
+    });
+
+    builder.Services.Configure<ApiBehaviorOptions>(options => 
+        options.InvalidModelStateResponseFactory = ctx =>
+        {
+            var message = ctx.ModelState.Values
+                .SelectMany(v => v.Errors)
+                .Select(e => e.ErrorMessage)
+                .FirstOrDefault() ?? "Validation failed.";
+
+            return new UnprocessableEntityObjectResult(
+                ApiResponse<object>.Fail(422, message, "VALIDATION_ERROR")
+            );
+        }
+    );
+
+    builder.Services.AddHealthChecks()
+        .AddNpgSql(
+            connectionString: builder.Configuration.GetConnectionString("Postgres")!,
+            name: "postgres",
+            tags: ["db", "ready"]
         );
+
+    var app = builder.Build();
+
+    app.UseSerilogRequestLogging(options =>
+    {
+        options.MessageTemplate =
+            "HTTP {RequestMethod} {RequestPath} responded {StatusCode} in {Elapsed:0.000}ms [{CorrelationId}]";
+
+        options.EnrichDiagnosticContext = (diagnosticContext, httpContext) =>
+        {
+            diagnosticContext.Set("RequestHost",   httpContext.Request.Host.Value);
+            diagnosticContext.Set("CorrelationId",
+                httpContext.Response.Headers["X-Correlation-ID"].ToString());
+        };
+    });
+
+    if (app.Environment.IsDevelopment())
+    {
+        app.UseSwagger();
+        app.UseSwaggerUI();
     }
-);
 
-var app = builder.Build();
+    app.UseMiddleware<CorrelationIdMiddleware>();
+    app.UseMiddleware<ExceptionHandlerMiddleware>();
 
-if (app.Environment.IsDevelopment())
+    // Migrations run under the migrator role, which holds DDL privileges
+    // The app role (dotnetter) cannot CREATE or ALTER tables, so it cannot run migrations
+    var migratorCs = app.Configuration.GetConnectionString("PostgresMigrator")!;
+
+    var migratorOptions = new DbContextOptionsBuilder<AllocationDbContext>()
+        .UseNpgsql(migratorCs)
+        .Options;
+    await using(var migratorDb = new AllocationDbContext(migratorOptions))
+        await migratorDb.Database.MigrateAsync();
+
+    // Seeding uses the app role to confirm that DML grants from ALTER DEFAULT PRIVILEGES
+    // FOR ROLE material_allocation_migrator are correct. If grants are missing, seeding fails.
+    using(var scope = app.Services.CreateScope())
+    {
+        var db = scope.ServiceProvider.GetRequiredService<AllocationDbContext>();
+
+        // Skip seeder in test environment - tess create their own known data
+        if(!app.Environment.IsEnvironment("Test"))
+            await SkuSeeder.SeedAsync(db);
+    }
+
+    app.MapControllers();
+    app.MapHealthChecks("/health", new HealthCheckOptions
+    {
+        ResponseWriter = WriteHealthJson
+    });
+
+    app.MapHealthChecks("/health/live", new HealthCheckOptions
+    {
+        // Liveness: always returns Healthy if the process is running. No dependency checks.
+        Predicate      = _ => false,
+        ResponseWriter = WriteHealthJson
+    });
+
+    app.MapHealthChecks("/health/ready", new HealthCheckOptions
+    {
+        // Readiness: returns Healthy only when all "ready"-tagged dependencies are up.
+        Predicate      = hc => hc.Tags.Contains("ready"),
+        ResponseWriter = WriteHealthJson
+    });
+    app.Run();
+}
+/***
+dotnet ef tools use HostFactoryResolver which throws HostAbortedException internally as a control-flow mechanism to stop the host after discovering the DbContext. 
+Your generic catch was swallowing it instead of letting it propagate, so EF saw the process exit abnormally.
+***/ 
+catch (HostAbortedException)
 {
-    app.UseSwagger();
-    app.UseSwaggerUI();
+    throw;
+}
+catch (Exception ex)
+{
+    Log.Fatal(ex, "Application failed to start.");
+}
+finally
+{
+    Log.CloseAndFlush();
 }
 
-app.UseMiddleware<ExceptionHandlerMiddleware>();
 
-// Migrations run under the migrator role, which holds DDL privileges
-// The app role (dotnetter) cannot CREATE or ALTER tables, so it cannot run migrations
-var migratorCs = app.Configuration.GetConnectionString("PostgresMigrator")!;
-
-var migratorOptions = new DbContextOptionsBuilder<AllocationDbContext>()
-    .UseNpgsql(migratorCs)
-    .Options;
-await using(var migratorDb = new AllocationDbContext(migratorOptions))
-    await migratorDb.Database.MigrateAsync();
-
-// Seeding uses the app role to confirm that DML grants from ALTER DEFAULT PRIVILEGES
-// FOR ROLE material_allocation_migrator are correct. If grants are missing, seeding fails.
-using(var scope = app.Services.CreateScope())
+static Task WriteHealthJson(HttpContext ctx, HealthReport report)
 {
-    var db = scope.ServiceProvider.GetRequiredService<AllocationDbContext>();
+    ctx.Response.ContentType = "application/json";
 
-    // Skip seeder in test environment - tess create their own known data
-    if(!app.Environment.IsEnvironment("Test"))
-        await SkuSeeder.SeedAsync(db);
+    var payload = new
+    {
+        status = report.Status.ToString(),
+        totalDuration = report.TotalDuration,
+        checks = report.Entries.Select(e => new
+        {
+            name        = e.Key,
+            status      = e.Value.Status.ToString(),
+            description = e.Value.Description,
+            duration    = e.Value.Duration,
+            tags        = e.Value.Tags
+        })
+    };
+
+    return ctx.Response.WriteAsJsonAsync(payload, new JsonSerializerOptions
+    {
+        WriteIndented   = true,
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase
+    });
 }
-
-app.MapControllers();
-app.Run();
 
 // Exposes Program as a public type so WebApplicationFactory<Program> can reference it
 // from the test project. The partial class matches the implicit top-level Program class.
 public partial class Program { }
+

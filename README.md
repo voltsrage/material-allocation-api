@@ -49,7 +49,10 @@ A `Reservation` places a soft hold on units for a specific order line until `Exp
 - **Reservation Expiry Job** — `ReservationExpiryJob` runs on a configurable interval (default 60 s) and deletes all rows where `expires_at <= NOW()`, restoring their quantity to availability automatically
 - **Shortage Rollup** — `GET /rollup/sku-shortages` returns a paged, shortage-descending list of SKUs where open unfulfilled demand exceeds available stock; open demand accounts for active reservations (a line covered by a reservation does not count as unmet demand); pure Dapper read with a single CTE shared between the COUNT and the paged SELECT
 - **Standard Envelope** — all responses use `{ success, statusCode, data, error }`; validation errors use the same shape; `[ApiController]` model-validation is overridden to produce the standard envelope instead of `ValidationProblemDetails`
-- **Swagger UI** — OpenAPI spec (Swashbuckle) with XML doc annotations, available at `/swagger` in Development
+- **Structured Logging** — every write operation logs its outcome via `ILogger<T>` after the transaction commits (order created/cancelled/allocated, SKU created/adjusted, reservation reserved/released/expired); Serilog enriches every entry with `MachineName`, `ThreadId`, and `CorrelationId`
+- **Correlation ID** — `CorrelationIdMiddleware` accepts an inbound `X-Correlation-ID` header (or generates a 12-char random ID); echoes it on the response; pushes it into Serilog's `LogContext` so every log entry within the request carries it automatically
+- **Health Checks** — `/health` (all checks), `/health/live` (process-up, no dependencies), `/health/ready` (PostgreSQL probe via Npgsql); returns `503` when the database is unreachable
+- **Swagger UI** — OpenAPI spec (Swashbuckle) with XML doc comments and a full API description, available at `/swagger` in Development
 - **Two-Role DB** — migrations run under a privileged migrator role; the app role (`dotnetter`) holds DML-only grants, so a compromised app process cannot alter schema
 - **SKU Seed Data** — 5 representative memory/NAND SKUs seeded on first startup (idempotent)
 
@@ -58,7 +61,14 @@ A `Reservation` places a soft hold on units for a specific order line until `Exp
 ## Architecture
 
 ```
-HTTP request → Middleware (ExceptionHandler) → Controllers → Services → EF Core / Dapper → PostgreSQL
+HTTP request
+  → CorrelationIdMiddleware   (assigns / echoes X-Correlation-ID; pushes CorrelationId into Serilog LogContext)
+  → ExceptionHandlerMiddleware (maps domain exceptions to standard envelope; logs warnings/errors with request path)
+  → Serilog request logging   (one structured log line per request: method, path, status, elapsed, correlation ID)
+  → Controllers
+  → Services                  (all writes log outcome via ILogger<T> after commit)
+  → EF Core / Dapper
+  → PostgreSQL
 ```
 
 Services are the only layer that touches the database. Controllers translate HTTP concerns (query params, status codes, response envelope) and delegate all business logic to the service layer. EF Core handles writes, aggregate loads, and raw-SQL locking queries; Dapper is used for multi-result read queries (order details with lines, paginated lists) where the result shape doesn't map cleanly to aggregate roots.
@@ -70,8 +80,9 @@ Services are the only layer that touches the database. Controllers translate HTT
 | Server | ASP.NET Core 8 (.NET 8.0) |
 | Database | PostgreSQL 15+ with EF Core 8 (code-first migrations) |
 | Micro-ORM | Dapper 2.1 |
+| Logging | Serilog — structured logs to Console + Seq; enriched with `MachineName`, `ThreadId`, `CorrelationId` |
 | Background worker | `BackgroundService` (`ReservationExpiryJob`) |
-| Docs | Swagger / OpenAPI (Swashbuckle) |
+| Docs | Swagger / OpenAPI (Swashbuckle) with XML doc comments |
 | Testing | xUnit + `WebApplicationFactory<Program>` — real Postgres database |
 
 ---
@@ -128,7 +139,8 @@ MaterialAllocationApi/
 │       ├── ConflictException.cs
 │       └── ValidationException.cs
 ├── Middleware/
-│   └── ExceptionHandlerMiddleware.cs       # Maps domain exceptions to standard envelope + status codes
+│   ├── CorrelationIdMiddleware.cs          # Assigns/echoes X-Correlation-ID; pushes into Serilog LogContext
+│   └── ExceptionHandlerMiddleware.cs       # Maps domain exceptions to standard envelope + status codes; logs with request path
 └── Migrations/                             # EF Core migration history
 
 MaterialAllocationApi.Tests/
@@ -545,11 +557,4 @@ On first startup, 5 representative memory and NAND SKUs are seeded automatically
 | 6 | Cancel + release — restores `on_hand` from line `allocated_qty` atomically; uses same lock order as allocate; fast path (no allocated units) skips transaction | Done |
 | 7 | Reservations — `reservations` table, `POST /orders/{id}/reserve` (TX + FOR UPDATE, TTL refresh), `POST /reservations/{id}/release`, `ReservationExpiryJob` background worker; allocate and cancel respect reservations | Done |
 | 8 | Shortage rollup — `GET /rollup/sku-shortages`: paged, shortage-descending list of SKUs where open demand (net of active reservations) exceeds available stock; pure Dapper CTE; 6 integration tests | Done |
-
----
-
-## Roadmap
-
-| Phase | Feature |
-|---|---|
-| 9 | Polish — health checks (`/health`, `/health/ready`), Seq structured logging, Swagger completeness pass |
+| 9 | Observability — Serilog structured logging (Console + Seq sink) with `MachineName`/`ThreadId`/`CorrelationId` enrichment; `ILogger<T>` in all services with post-commit log entries; `CorrelationIdMiddleware`; health checks (`/health`, `/health/live`, `/health/ready`) with Npgsql probe; Swagger XML doc comments and full API description | Done |

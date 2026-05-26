@@ -42,6 +42,8 @@ public class ReservationService : IReservationService
 
         if(deleted == 0)
             throw new NotFoundException($"Reservation {reservationId} not found.");
+
+        _logger.LogInformation("Reservation {ReservationId} released.", reservationId);
     }
 
     public async Task<ReservationResponse> ReserveAsync(Guid orderId, ReserveRequest request, CancellationToken ct = default)
@@ -145,6 +147,10 @@ public class ReservationService : IReservationService
 
             await _db.SaveChangesAsync(ct);
             await tx.CommitAsync(ct);
+
+            _logger.LogInformation(
+                "Order {OrderId} reserved {LineCount} line(s), expires={ExpiresAt}.",
+                orderId, results.Count, expiresAt.UtcDateTime);
 
             return new ReservationResponse(order.Id, order.ReferenceCode, results, expiresAt.UtcDateTime);
         }

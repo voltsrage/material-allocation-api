@@ -8,11 +8,13 @@ public class AllocationService : IAllocationService
 {
     private readonly AllocationDbContext _db;
     private readonly IDbConnectionFactory _connectionFactory;
+    private readonly ILogger<AllocationService> _logger;
 
-    public AllocationService(AllocationDbContext db, IDbConnectionFactory connectionFactory)
+    public AllocationService(AllocationDbContext db, IDbConnectionFactory connectionFactory, ILogger<AllocationService> logger)
     {
         _db = db;
         _connectionFactory = connectionFactory;
+        _logger = logger;
     }
 
     public async Task<AllocationResponse> AllocateAsync(Guid orderId, CancellationToken ct = default)
@@ -129,6 +131,10 @@ public class AllocationService : IAllocationService
 
             await _db.SaveChangesAsync(ct);
             await tx.CommitAsync(ct);
+
+            _logger.LogInformation(
+                "Order {OrderId} allocated: status={Status}, lines={LineCount}, fullyAllocated={IsFullyAllocated}",
+                orderId, order.Status.ToDbString(), results.Count, order.Status == OrderStatus.FullyAllocated);
 
             return new AllocationResponse(
                 order.Id,

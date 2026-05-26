@@ -7,11 +7,13 @@ public class OrderService : IOrderService
 {
     private readonly AllocationDbContext _db;
     private readonly IDbConnectionFactory _connectionFactory;
+    private readonly ILogger<OrderService> _logger;
 
-    public OrderService(AllocationDbContext db, IDbConnectionFactory connectionFactory)
+    public OrderService(AllocationDbContext db, IDbConnectionFactory connectionFactory, ILogger<OrderService> logger)
     {
         _db = db;
         _connectionFactory = connectionFactory;
+        _logger = logger;
     }
 
     public async Task<OrderResponse> CancelAsync(Guid id, CancellationToken ct = default)
@@ -54,6 +56,7 @@ public class OrderService : IOrderService
                     new NpgsqlParameter("ids", allLineIds));
             }
             await _db.SaveChangesAsync(ct);
+            _logger.LogInformation("Order {OrderId} cancelled. AllocatedLinesReleased=0.", id);
             return await GetByIdAsync(order.Id, ct);
         }
 
@@ -114,14 +117,15 @@ public class OrderService : IOrderService
             // All or nothing
             await _db.SaveChangesAsync(ct);
             await tx.CommitAsync(ct);
+            _logger.LogInformation(
+                "Order {OrderId} cancelled. AllocatedLinesReleased={ReleasedCount}.",
+                id, allocatedLines.Count);
         }
         catch (Exception)
         {
             await TransactionHelper.RollbackAsync(tx);
             throw;
         }
-
-        
 
         return await GetByIdAsync(order.Id, ct);
 
@@ -182,6 +186,10 @@ public class OrderService : IOrderService
         {
             throw new ValidationException($"Reference code '{request.ReferenceCode}' already exists.");
         }
+
+        _logger.LogInformation(
+            "Order {OrderId} created: referenceCode={ReferenceCode}, lines={LineCount}.",
+            order.Id, order.ReferenceCode, order.Lines.Count);
 
         // 4. Return the full response via Dapper so SkuCode is populated in order lines.
         return await GetByIdAsync(order.Id,ct);

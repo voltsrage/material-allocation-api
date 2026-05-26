@@ -1,5 +1,6 @@
 using Microsoft.AspNetCore.Mvc;
 
+/// <summary>SKU catalog and inventory adjustment operations.</summary>
 [ApiController]
 [Route("api/v1/skus")]
 public class SkusController : ControllerBase

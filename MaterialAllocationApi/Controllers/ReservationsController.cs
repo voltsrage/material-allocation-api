@@ -1,5 +1,6 @@
 using Microsoft.AspNetCore.Mvc;
 
+/// <summary>Explicit reservation release before TTL expiry.</summary>
 [ApiController]
 [Route("api/v1/reservations")]
 public class ReservationsController: ControllerBase

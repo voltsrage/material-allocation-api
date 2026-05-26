@@ -1,5 +1,6 @@
 using Microsoft.AspNetCore.Mvc;
 
+/// <summary>Order lifecycle: create, list, get, allocate, reserve, and cancel.</summary>
 [ApiController]
 [Route("api/v1/orders")]
 public class OrdersController : ControllerBase

@@ -6,11 +6,13 @@ public class SkuService : ISkuService
 {
     private readonly AllocationDbContext _db;
     private readonly IDbConnectionFactory _connectionFactory;
+    private readonly ILogger<SkuService> _logger;
 
-    public SkuService(AllocationDbContext db, IDbConnectionFactory connectionFactory)
+    public SkuService(AllocationDbContext db, IDbConnectionFactory connectionFactory, ILogger<SkuService> logger)
     {
         _db = db;
         _connectionFactory = connectionFactory;
+        _logger = logger;
     }
 
     public async Task<SkuResponse> AdjustAsync(Guid id, AdjustSkuRequest request, CancellationToken ct = default)
@@ -46,7 +48,10 @@ public class SkuService : ISkuService
                 "SKU was modified by a concurrent request. Re-read the current state and retry.",
                 "CONCURRENT_MODIFICATION");
         }
-        
+
+        _logger.LogInformation(
+            "SKU {SkuId} adjusted by {Delta}: reason={Reason}, onHand={OnHand}.",
+            id, request.Delta, request.Reason, sku.OnHand);
         return ToResponse(sku);
     }
 
@@ -74,6 +79,7 @@ public class SkuService : ISkuService
             throw new ValidationException($"SKU code '{request.SkuCode}' already exists.");
         }
 
+        _logger.LogInformation("SKU {SkuId} created: code={SkuCode}, onHand={OnHand}.", sku.Id, sku.SkuCode, sku.OnHand);
         return ToResponse(sku);
 
     }

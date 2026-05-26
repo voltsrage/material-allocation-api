@@ -1,5 +1,6 @@
 using Microsoft.AspNetCore.Mvc;
 
+/// <summary>Operational read models: shortage detection across the SKU catalog.</summary>
 [ApiController]
 [Route("api/v1/rollup")]
 public class RollupController : ControllerBase
