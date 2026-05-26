@@ -1,6 +1,7 @@
 
 using Dapper;
 using Microsoft.EntityFrameworkCore;
+using Npgsql;
 
 public class OrderService : IOrderService
 {
@@ -15,6 +16,11 @@ public class OrderService : IOrderService
 
     public async Task<OrderResponse> CancelAsync(Guid id, CancellationToken ct = default)
     {
+        // 1. Pre-flight: load order with lines for hte status check.
+        // Done outside the transaction for speed - avoids locking rows for orders that
+        // cannot be cancelled. The real state is re-validated inside the transaction
+        // after the FOR UPDATE lock guarantees no concurrent cancel or allocate can
+        // change the row
         var order = await _db.Orders
             .Include(o => o.Lines)
             .FirstOrDefaultAsync(o => o.Id == id, ct)
@@ -26,13 +32,83 @@ public class OrderService : IOrderService
         }
         catch (InvalidOperationException ex)
         {
-            throw new ConflictException(ex.Message, "ORDER_ALREADY_CANCELLED");
+            var code = ex.Message.Contains("already cancelled")
+                ? "ORDER_ALREADY_CANCELLED"
+                : "INVALID_STATUS_TRANSITION";
+            throw new ConflictException(ex.Message, code);
         }
 
-        // Phase 6: for each line with allocated_qty > 0, call Sku.ReleaseUnits(line.AllocatedQty)
-        // and line.ReleaseAllocation() inside this same SaveChangesAsync to restore on_hand atomically
+        // 2. Collect SKU IDs that have allocated units to release.
+        // Only lines with allocated qty > 0 require a lock and a release
+        // If the order has never allocated (all lines at 0), we still cancel but skip the
+        // lock acquisition entirely - no inventory change needed
+        var allocatedLines = order.Lines
+            .Where(l => l.AllocatedQty > 0)
+            .ToList();
 
-        await _db.SaveChangesAsync(ct);
+        if(allocatedLines.Count == 0)
+        {
+            // Fast path: no inventory to release. Single save, no transaction needed.
+            await _db.SaveChangesAsync(ct);
+            return await GetByIdAsync(order.Id, ct);
+        }
+
+        // 3. Sort SKU IDs ascending - same order as AllocatedAsync - to prevent deadlocks
+        // when a concurrent allocation and cancel share multiple SKUs.
+        var skuIds = allocatedLines
+            .Select(l => l.SkuId)
+            .Distinct()
+            .OrderBy(id => id)
+            .ToArray();
+
+        // 4. Begin the explicit transaction. The FOR UPDATE lock must be held until
+        // SaveChanges commits - releasing it early would allow concurrent allocations
+        // to read stale on_hand values between the lock release and the commit
+        await using var tx = await _db.Database.BeginTransactionAsync(ct);
+
+        try
+        {
+            // 5. Lock SKU rows in deterministic order.
+            // EF's identity map means the entities locked here are the same objects
+            // already in memory from the pre-flight Include - no second round-trip
+            // The FOR UPDATE in the SQL is what matters; EF just executes it.
+            await _db.Skus
+                .FromSqlRaw(
+                    "SELECT * FROM skus WHERE id = ANY(@ids) ORDER BY id FOR UPDATE",
+                    new NpgsqlParameter("ids", skuIds)
+                ).ToListAsync();
+
+            // 6. Release each allocated line.
+            // Read allocated_qty from the tracked entity - safe because the FOR UPDATE
+            // above prevents any concurrent AllocateAsync from modifying these rows
+            // after we acquired the lock
+            foreach(var line in allocatedLines)
+            {
+                var sku = await _db.Skus.FindAsync([line.SkuId], ct)
+                    ?? throw new InvalidOperationException(
+                        $"SKU {line.SkuId} referenced by order line {line.Id} not found."
+                    );
+
+                sku.ReleaseUnits(line.AllocatedQty);
+                line.ReleasedAllocation();
+            }
+
+            // 7. Order status is already set to "cancelled" by the pre-flight Cancel() call;
+            // SaveChangesAsync persists:
+            //  - orders.status = 'cancelled'
+            //  - order_lines.allocated_qty = 0 for each released line
+            //  - skus.on_hand incremented by the released amount
+            // All or nothing
+            await _db.SaveChangesAsync(ct);
+            await tx.CommitAsync(ct);
+        }
+        catch (Exception)
+        {
+            await TransactionHelper.RollbackAsync(tx);
+            throw;
+        }
+
+        
 
         return await GetByIdAsync(order.Id, ct);
 

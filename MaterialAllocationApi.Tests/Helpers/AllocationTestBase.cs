@@ -13,7 +13,7 @@ public abstract class AllocationTestBase : IAsyncLifetime
     protected readonly ApiFixture Fixture;
     protected readonly HttpClient Client;
 
-    private static readonly JsonSerializerOptions JsonOptions = new()
+    protected static readonly JsonSerializerOptions JsonOptions = new()
     {
         PropertyNameCaseInsensitive = true,
     };
@@ -93,7 +93,7 @@ public abstract class AllocationTestBase : IAsyncLifetime
         response.EnsureSuccessStatusCode();
     }
 
-    private static async Task<T> ReadAsync<T>(HttpResponseMessage response)
+    protected static async Task<T> ReadAsync<T>(HttpResponseMessage response)
     {
         var envelope = await response.Content
             .ReadFromJsonAsync<ApiResponse<T>>(JsonOptions);

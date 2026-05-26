@@ -114,24 +114,10 @@ public class AllocationService : IAllocationService
         }       
         catch (Exception)
         {
-            await RollbackAsync(tx);
+            await TransactionHelper.RollbackAsync(tx);
             throw;
         }
-    }
-
-    private static async Task<bool> RollbackAsync(IDbContextTransaction tx)
-    {
-       try
-       {
-            await tx.RollbackAsync();
-       }
-       catch (Exception)
-       {
-            /* swallow — original exception takes priority */
-       }
-
-       return false;
-    }
+    }    
 
     public async Task<AvailabilityResponse> GetAvailabilityAsync(Guid skuId, CancellationToken ct = default)
     {

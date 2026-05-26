@@ -3,6 +3,9 @@ public class Order
     private static readonly HashSet<string> ValidPriorities = 
     ["standard", "high", "critical"];
 
+    private static readonly HashSet<string> CancellableStatuses =
+    ["open", "partially_allocated", "fully_allocated"];
+
     public Guid Id { get; private set; }
     public string ReferenceCode  { get; private set; } = string.Empty;
     public string Priority  { get; private set; } = string.Empty;
@@ -38,6 +41,11 @@ public class Order
     {
         if(Status == "cancelled")
             throw new InvalidOperationException("Order is already cancelled");
+
+        if(!CancellableStatuses.Contains(Status))
+            throw new InvalidOperationException(
+                $"Cannot cancel an order in status '{Status}.'"
+            );
 
         Status = "cancelled";
     }
