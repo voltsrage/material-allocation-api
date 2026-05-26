@@ -69,9 +69,15 @@ await using(var migratorDb = new AllocationDbContext(migratorOptions))
 using(var scope = app.Services.CreateScope())
 {
     var db = scope.ServiceProvider.GetRequiredService<AllocationDbContext>();
-    await SkuSeeder.SeedAsync(db);
+
+    // Skip seeder in test environment - tess create their own known data
+    if(!app.Environment.IsEnvironment("Test"))
+        await SkuSeeder.SeedAsync(db);
 }
 
 app.MapControllers();
 app.Run();
 
+// Exposes Program as a public type so WebApplicationFactory<Program> can reference it
+// from the test project. The partial class matches the implicit top-level Program class.
+public partial class Program { }
