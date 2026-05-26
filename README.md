@@ -47,6 +47,7 @@ A `Reservation` places a soft hold on units for a specific order line until `Exp
 - **Reservations** — `POST /orders/{id}/reserve` places a TTL-bounded hold per line against available stock; own-order reservation does not block own allocation; calling reserve again replaces the existing hold (idempotent TTL refresh)
 - **Reservation Release** — `POST /reservations/{id}/release` explicitly removes a reservation before it expires
 - **Reservation Expiry Job** — `ReservationExpiryJob` runs on a configurable interval (default 60 s) and deletes all rows where `expires_at <= NOW()`, restoring their quantity to availability automatically
+- **Shortage Rollup** — `GET /rollup/sku-shortages` returns a paged, shortage-descending list of SKUs where open unfulfilled demand exceeds available stock; open demand accounts for active reservations (a line covered by a reservation does not count as unmet demand); pure Dapper read with a single CTE shared between the COUNT and the paged SELECT
 - **Standard Envelope** — all responses use `{ success, statusCode, data, error }`; validation errors use the same shape; `[ApiController]` model-validation is overridden to produce the standard envelope instead of `ValidationProblemDetails`
 - **Swagger UI** — OpenAPI spec (Swashbuckle) with XML doc annotations, available at `/swagger` in Development
 - **Two-Role DB** — migrations run under a privileged migrator role; the app role (`dotnetter`) holds DML-only grants, so a compromised app process cannot alter schema
@@ -84,7 +85,8 @@ MaterialAllocationApi/
 ├── Controllers/
 │   ├── SkusController.cs                   # Create, get, list, adjust, availability
 │   ├── OrdersController.cs                 # Create, get, list, cancel, allocate, reserve
-│   └── ReservationsController.cs           # Release
+│   ├── ReservationsController.cs           # Release
+│   └── RollupController.cs                 # GET sku-shortages
 ├── Domain/Entities/
 │   ├── Sku.cs                              # AllocateUnits(), ReleaseUnits(); version concurrency token
 │   ├── InventoryAdjustment.cs
@@ -98,18 +100,21 @@ MaterialAllocationApi/
 │   ├── SkuRecords.cs                       # CreateSkuRequest / AdjustSkuRequest / SkuResponse
 │   ├── OrderRecords.cs                     # CreateOrderRequest / OrderResponse / OrderSummaryResponse
 │   ├── AllocationRecords.cs                # AllocationResponse / AllocationLineResult / AvailabilityResponse
-│   └── ReservationRecords.cs               # ReserveRequest / ReservationResponse / ReservationLineResult
+│   ├── ReservationRecords.cs               # ReserveRequest / ReservationResponse / ReservationLineResult
+│   └── RollupRecords.cs                    # SkuShortageResponse
 ├── Services/
 │   ├── Interfaces/
 │   │   ├── ISkuService.cs
 │   │   ├── IOrderService.cs
 │   │   ├── IAllocationService.cs
-│   │   └── IReservationService.cs
+│   │   ├── IReservationService.cs
+│   │   └── IRollupService.cs
 │   ├── SkuService.cs                       # Create, GetById, List, AdjustAsync (optimistic concurrency)
 │   ├── OrderService.cs                     # Create, GetById, List, CancelAsync (TX + FOR UPDATE)
 │   ├── AllocationService.cs                # AllocateAsync (TX + FOR UPDATE), GetAvailabilityAsync
 │   ├── ReservationService.cs               # ReserveAsync (TX + FOR UPDATE), ReleaseAsync, ExpireAsync
-│   └── ReservationExpiryJob.cs             # BackgroundService — DELETE WHERE expires_at <= NOW()
+│   ├── ReservationExpiryJob.cs             # BackgroundService — DELETE WHERE expires_at <= NOW()
+│   └── RollupService.cs                    # GetSkuShortageAsync — Dapper CTE, no writes
 ├── Data/
 │   ├── AllocationDbContext.cs              # EF Core context — entity configs, indexes, CHECK constraints
 │   ├── IDbConnectionFactory.cs / NpgsqlConnectionFactory.cs
@@ -131,11 +136,13 @@ MaterialAllocationApi.Tests/
 │   └── ApiFixture.cs                       # WebApplicationFactory<Program>; MigrateAsync on init; ResetDatabaseAsync between tests
 ├── Helpers/
 │   └── AllocationTestBase.cs               # HTTP helpers (CreateSkuAsync, CreateOrderAsync, AllocateAsync, …); DB assertion helpers
-└── Allocation/
-    ├── AllocationFlowTests.cs              # Partial allocation, sequential top-up, over-demand
-    ├── ConcurrentAllocationTests.cs        # Two parallel allocates on the same SKU — exactly one wins
-    ├── CancelTests.cs                      # Cancel + inventory restoration; cancel with no allocations
-    └── ReservationTests.cs                 # Reserve, block, own-order exception, TTL refresh, release, expiry, cancel-deletes
+├── Allocation/
+│   ├── AllocationFlowTests.cs              # Partial allocation, sequential top-up, over-demand
+│   ├── ConcurrentAllocationTests.cs        # Two parallel allocates on the same SKU — exactly one wins
+│   ├── CancelTests.cs                      # Cancel + inventory restoration; cancel with no allocations
+│   └── ReservationTests.cs                 # Reserve, block, own-order exception, TTL refresh, release, expiry, cancel-deletes
+└── Rollup/
+    └── RollupTests.cs                      # 6 shortage tests: empty, fully allocated, open, partial, reservations, ordering
 ```
 
 ---
@@ -399,6 +406,36 @@ Returns 204 on success, 404 if the reservation does not exist.
 
 ---
 
+### Rollup
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/rollup/sku-shortages` | Paged list of SKUs where open demand exceeds available stock |
+
+**GET `/rollup/sku-shortages` query params:**
+
+| Param | Default | Description |
+|---|---|---|
+| `page` | 1 | Page number (1-based) |
+| `pageSize` | 25 | Items per page (max 100) |
+
+Response items:
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | Guid | SKU ID |
+| `skuCode` | string | SKU code |
+| `description` | string | SKU description |
+| `onHand` | int | Current on-hand quantity |
+| `reserved` | int | Sum of active (non-expired) reservation quantities for this SKU |
+| `available` | int | `onHand - reserved` |
+| `openDemand` | int | Sum of unfulfilled line quantities not covered by active reservations, across `open` and `partially_allocated` orders |
+| `shortage` | int | `openDemand - available`; always > 0 for rows returned by this endpoint |
+
+Results are ordered by `shortage` descending (worst shortages first), then `skuCode`. Returns an empty list when no SKU is short.
+
+---
+
 ## Data Models
 
 ### Sku
@@ -507,6 +544,7 @@ On first startup, 5 representative memory and NAND SKUs are seeded automatically
 | 5 | Concurrency tests — two parallel allocates on a single-unit SKU; exactly one wins; invariant verification (on_hand + allocated = original stock) | Done |
 | 6 | Cancel + release — restores `on_hand` from line `allocated_qty` atomically; uses same lock order as allocate; fast path (no allocated units) skips transaction | Done |
 | 7 | Reservations — `reservations` table, `POST /orders/{id}/reserve` (TX + FOR UPDATE, TTL refresh), `POST /reservations/{id}/release`, `ReservationExpiryJob` background worker; allocate and cancel respect reservations | Done |
+| 8 | Shortage rollup — `GET /rollup/sku-shortages`: paged, shortage-descending list of SKUs where open demand (net of active reservations) exceeds available stock; pure Dapper CTE; 6 integration tests | Done |
 
 ---
 
@@ -514,5 +552,4 @@ On first startup, 5 representative memory and NAND SKUs are seeded automatically
 
 | Phase | Feature |
 |---|---|
-| 8 | Shortage rollup — `GET /rollup/sku-shortages`: SKUs where open demand exceeds availability |
 | 9 | Polish — health checks (`/health`, `/health/ready`), Seq structured logging, Swagger completeness pass |

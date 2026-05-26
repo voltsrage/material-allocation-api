@@ -26,6 +26,7 @@ builder.Services.AddScoped<IOrderService, OrderService>();
 builder.Services.AddScoped<IAllocationService, AllocationService>();
 builder.Services.AddScoped<IReservationService, ReservationService>();
 builder.Services.AddHostedService<ReservationExpiryJob>();
+builder.Services.AddScoped<IRollupService, RollupService>();
 
 builder.Services.AddControllers()
     .AddJsonOptions(o =>
