@@ -1,31 +1,20 @@
 public class Order
 {
-    private static readonly HashSet<string> ValidPriorities = 
-    ["standard", "high", "critical"];
-
-    private static readonly HashSet<string> CancellableStatuses =
-    ["open", "partially_allocated", "fully_allocated"];
-
     public Guid Id { get; private set; }
-    public string ReferenceCode  { get; private set; } = string.Empty;
-    public string Priority  { get; private set; } = string.Empty;
-    public string Status { get; private set; } = string.Empty;
-    public DateTimeOffset CreatedAt  { get; private set; }
+    public string ReferenceCode { get; private set; } = string.Empty;
+    public OrderPriority Priority { get; private set; }
+    public OrderStatus Status { get; private set; }
+    public DateTimeOffset CreatedAt { get; private set; }
 
-    public ICollection<OrderLine> Lines  { get; private set; } = new List<OrderLine>();
+    public ICollection<OrderLine> Lines { get; private set; } = new List<OrderLine>();
 
     private Order() {}
 
-    public Order(string referenceCode, string priority)
+    public Order(string referenceCode, OrderPriority priority)
     {
-        if(!ValidPriorities.Contains(priority))
-            throw new ArgumentException(
-                $"Invalid priority '{priority}'. Valid values: {string.Join(", ", ValidPriorities)}"
-            );
-
         ReferenceCode = referenceCode;
         Priority = priority;
-        Status = "open";
+        Status = OrderStatus.Open;
         CreatedAt = DateTimeOffset.UtcNow;
     }
 
@@ -39,19 +28,14 @@ public class Order
 
     public void Cancel()
     {
-        if(Status == "cancelled")
+        if(Status == OrderStatus.Cancelled)
             throw new InvalidOperationException("Order is already cancelled");
 
-        if(!CancellableStatuses.Contains(Status))
-            throw new InvalidOperationException(
-                $"Cannot cancel an order in status '{Status}.'"
-            );
-
-        Status = "cancelled";
+        Status = OrderStatus.Cancelled;
     }
 
-    // Called by the allocation service (Phase 4) after updating line allocated quantities
-    // Reads Lines collection - caller must ensure it is loaded before calling
+    // Called by the allocation service after updating line allocated quantities.
+    // Reads Lines collection — caller must ensure it is loaded before calling.
     public void RecomputeStatus()
     {
         if(!Lines.Any()) return;
@@ -61,9 +45,9 @@ public class Order
 
         Status = totalAllocated switch
         {
-            0 => "open",
-            var a when a >= totalRequested => "fully_allocated",
-            _ => "partially_allocated"  
+            0                              => OrderStatus.Open,
+            var a when a >= totalRequested => OrderStatus.FullyAllocated,
+            _                              => OrderStatus.PartiallyAllocated
         };
     }
 }

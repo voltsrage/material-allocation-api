@@ -7,10 +7,13 @@ public class OrdersController : ControllerBase
     private readonly IOrderService _orders;
     private readonly IAllocationService _allocation;
 
-    public OrdersController(IOrderService orders, IAllocationService allocation)
+    private readonly IReservationService _reservations;
+
+    public OrdersController(IOrderService orders, IAllocationService allocation, IReservationService reservations)
     {
         _orders = orders;
         _allocation = allocation;
+        _reservations = reservations;
     }
 
     /// <summary>Create an order with one or more lines referencing existing SKUs.</summary>
@@ -91,5 +94,26 @@ public class OrdersController : ControllerBase
     {
         var result = await _allocation.AllocateAsync(id, ct);
         return Ok(ApiResponse<AllocationResponse>.Ok(result));
+    }
+
+    /// <summary>
+    /// Reserve available stock for each open order line for the specified TTL.
+    /// Calling reserve again for the same order replaces existing reservations (TTL refresh).
+    /// available = on_hand - reservations held by other orders.
+    /// </summary>
+    /// <response code="200">Reservation created. Lines array may be empty if no stock is available to reserve.</response>
+    /// <response code="404">Order not found.</response>
+    /// <response code="409">Order is cancelled or fully allocated.</response>
+    [HttpPost("{id:guid}/reserve")]
+    [ProducesResponseType(typeof(ApiResponse<ReservationResponse>), StatusCodes.Status200OK)]
+    [ProducesResponseType(typeof(ApiResponse<object>), StatusCodes.Status409Conflict)]
+    public async Task<ActionResult<ApiResponse<ReservationResponse>>>Reserve(
+        Guid id,
+        ReserveRequest request,
+        CancellationToken ct
+    )
+    {
+        var result = await _reservations.ReserveAsync(id, request, ct);
+        return Ok(ApiResponse<ReservationResponse>.Ok(result));
     }
 }

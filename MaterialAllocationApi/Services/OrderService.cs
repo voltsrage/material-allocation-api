@@ -32,10 +32,7 @@ public class OrderService : IOrderService
         }
         catch (InvalidOperationException ex)
         {
-            var code = ex.Message.Contains("already cancelled")
-                ? "ORDER_ALREADY_CANCELLED"
-                : "INVALID_STATUS_TRANSITION";
-            throw new ConflictException(ex.Message, code);
+            throw new ConflictException(ex.Message, "ORDER_ALREADY_CANCELLED");
         }
 
         // 2. Collect SKU IDs that have allocated units to release.
@@ -49,6 +46,13 @@ public class OrderService : IOrderService
         if(allocatedLines.Count == 0)
         {
             // Fast path: no inventory to release. Single save, no transaction needed.
+            var allLineIds = order.Lines.Select(l => l.Id).ToArray();
+            if (allLineIds.Length > 0)
+            {
+                await _db.Database.ExecuteSqlRawAsync(
+                    "DELETE FROM reservations WHERE order_line_id = ANY(@ids)",
+                    new NpgsqlParameter("ids", allLineIds));
+            }
             await _db.SaveChangesAsync(ct);
             return await GetByIdAsync(order.Id, ct);
         }
@@ -93,9 +97,18 @@ public class OrderService : IOrderService
                 line.ReleasedAllocation();
             }
 
-            // 7. Order status is already set to "cancelled" by the pre-flight Cancel() call;
+            var allLineIds = order.Lines.Select(l => l.Id).ToArray();
+            if(allLineIds.Length > 0)
+            {
+                await _db.Database.ExecuteSqlRawAsync(
+                    "DELETE FROM reservations WHERE order_line_id = ANY(@ids)",
+                    new NpgsqlParameter("ids", allLineIds)
+                );
+            }
+
+            // 7. Order status is already set to Cancelled by the pre-flight Cancel() call;
             // SaveChangesAsync persists:
-            //  - orders.status = 'cancelled'
+            //  - orders.status = 'cancelled' (via EF value converter)
             //  - order_lines.allocated_qty = 0 for each released line
             //  - skus.on_hand incremented by the released amount
             // All or nothing
@@ -145,16 +158,7 @@ public class OrderService : IOrderService
             );
 
         // 3. Build the aggregate
-        Order order;
-        try
-        {
-            order = new Order(request.ReferenceCode, request.Priority);
-
-        }
-        catch (ArgumentException ex)
-        {
-            throw new ValidationException(ex.Message);
-        }
+        var order = new Order(request.ReferenceCode, request.Priority);
 
         foreach(var line in request.Lines)
         {

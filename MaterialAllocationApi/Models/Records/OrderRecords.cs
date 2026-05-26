@@ -7,7 +7,7 @@ public record CreateOrderLineRequest(
 
 public record CreateOrderRequest(
     [Required, MaxLength(64)] string ReferenceCode,
-    [Required] string Priority,
+    [Required] OrderPriority Priority,
     [Required, MinLength(1)] IReadOnlyList<CreateOrderLineRequest> Lines
 );
 

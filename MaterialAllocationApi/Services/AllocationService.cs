@@ -25,11 +25,11 @@ public class AllocationService : IAllocationService
             .FirstOrDefaultAsync(o => o.Id == orderId, ct)
             ?? throw new NotFoundException($"Order {orderId} not found.");
 
-        if(order.Status == "cancelled")
+        if(order.Status == OrderStatus.Cancelled)
             throw new ConflictException(
                 "Cannot allocate a cancelled order", "ORDER_CANCELLED");
 
-        if(order.Status == "fully_allocated")
+        if(order.Status == OrderStatus.FullyAllocated)
             throw new ConflictException(
                 "Order is already fully allocated.",
                 "ORDER_FULLY_ALLOCATED"
@@ -62,6 +62,28 @@ public class AllocationService : IAllocationService
 
             var skuMap = skus.ToDictionary(s => s.Id);
 
+            // Read reservations held by other orders for these SKUs.
+            // Must run after the FOR UPDATE lock is acquired
+            var conn = (NpgsqlConnection)_db.Database.GetDbConnection();
+            var dbTx = (NpgsqlTransaction)tx.GetDbTransaction();
+
+            var reservedRows = await conn.QueryAsync<(Guid SkuId, int Reserved)>
+            (
+                @"
+                SELECT ol.sku_id as SkuId, COALESCE(SUM(r.quantity), 0) AS Reserved
+                FROM reservations r
+                JOIN order_lines ol ON ol.id = r.order_line_id
+                WHERE ol.sku_id = ANY(@ids)
+                    AND ol.order_id != @orderId
+                    AND r.expires_at > NOW()
+                GROUP BY ol.sku_id
+                ",
+                new {ids = skuIds, orderId},
+                transaction: dbTx
+            );
+
+            var reservedByOthers = reservedRows.ToDictionary(r => r.SkuId, r => r.Reserved);
+
             // 5. Allocate each line in sku_id order (same as lock order - belt and suspenders)
             var results = new List<AllocationLineResult>();
 
@@ -73,7 +95,10 @@ public class AllocationService : IAllocationService
                     );
 
                 var remaining = line.RequestedQty - line.AllocatedQty;
-                var canAllocate = Math.Min(sku.OnHand, remaining);
+
+                var othersHeld = reservedByOthers.GetValueOrDefault(sku.Id);
+                var available = Math.Max(0, sku.OnHand - othersHeld);
+                var canAllocate = Math.Min(available, remaining);
 
                 if(canAllocate > 0)
                 {
@@ -107,8 +132,8 @@ public class AllocationService : IAllocationService
 
             return new AllocationResponse(
                 order.Id,
-                order.Status,
-                order.Status == "fully_allocated",
+                order.Status.ToDbString(),
+                order.Status == OrderStatus.FullyAllocated,
                 results
             );
         }       
@@ -143,8 +168,17 @@ public class AllocationService : IAllocationService
         // Phase 7 will query: SELECT COALESCE(SUM(quantity), 0) FROM reservations
         // WHERE order_line_id in (...) AND expires_at > NOW()
         // and subtract that from on_hand here.
-        const int reserved = 0;
-        return new AvailabilityResponse(row.Id, row.SkuCode, row.OnHand, reserved, row.OnHand - reserved);
+        var reserved = await connection.ExecuteScalarAsync<int>(
+            @"
+            SELECT COALESCE(SUM(r.quantity), 0)
+            FROM reservations r
+            JOIN order_lines ol ON ol.id = r.order_line_id
+            WHERE ol.sku_id = @SkuId
+                AND r.expires_at > NOW()
+            ",
+            new {SkuId = skuId}
+        );
+        return new AvailabilityResponse(row.Id, row.SkuCode, row.OnHand, reserved, Math.Max(0, row.OnHand - reserved));
     }
 
     private record SkuAvailRow(Guid Id, string SkuCode, int OnHand);

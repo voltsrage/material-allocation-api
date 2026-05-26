@@ -1,4 +1,5 @@
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 
 public class AllocationDbContext : DbContext
 {
@@ -8,6 +9,7 @@ public class AllocationDbContext : DbContext
     public DbSet<InventoryAdjustment> InventoryAdjustments => Set<InventoryAdjustment>();
     public DbSet<Order> Orders => Set<Order>();
     public DbSet<OrderLine> OrderLines => Set<OrderLine>();
+    public DbSet<Reservation> Reservations => Set<Reservation>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -55,8 +57,14 @@ public class AllocationDbContext : DbContext
             b.HasKey(x => x.Id);
             b.Property(x => x.Id).HasColumnName("id").HasDefaultValueSql("gen_random_uuid()");
             b.Property(x => x.ReferenceCode).HasColumnName("reference_code").HasMaxLength(64).IsRequired();
-            b.Property(x => x.Priority).HasColumnName("priority").HasMaxLength(32).IsRequired();
-            b.Property(x => x.Status).HasColumnName("status").HasMaxLength(32).IsRequired();
+            b.Property(x => x.Priority).HasColumnName("priority").HasMaxLength(32).IsRequired()
+                .HasConversion(
+                    v => v.ToDbString(),
+                    v => OrderPriorityExtensions.FromDbString(v));
+            b.Property(x => x.Status).HasColumnName("status").HasMaxLength(32).IsRequired()
+                .HasConversion(
+                    v => v.ToDbString(),
+                    v => OrderStatusExtensions.FromDbString(v));
             b.Property(x => x.CreatedAt).HasColumnName("created_at").IsRequired();
 
             // Uniqueness: reference_code is the caller-assigned natural key
@@ -94,6 +102,30 @@ public class AllocationDbContext : DbContext
             b.HasIndex(x => new { x.OrderId, x.SkuId }).IsUnique().HasDatabaseName("idx_order_lines_order_sku");
             // FK lookup: allocation service loads all lines for an order; this covers the join
             b.HasIndex(x => x.OrderId).HasDatabaseName("idx_order_lines_order_id");
+        });
+
+        modelBuilder.Entity<Reservation>(b =>
+        {
+            b.ToTable("reservations", t =>
+            {
+                t.HasCheckConstraint("chk_reservations_quantity_positive", "quantity > 0");
+            });
+            b.HasKey(x => x.Id);
+            b.Property(x => x.Id).HasColumnName("id").HasDefaultValueSql("gen_random_uuid()");
+            b.Property(x => x.OrderLineId).HasColumnName("order_line_id").IsRequired();
+            b.Property(x => x.Quantity).HasColumnName("quantity").IsRequired();
+            b.Property(x => x.ExpiresAt).HasColumnName("expires_at").IsRequired();
+            b.Property(x => x.CreatedAt).HasColumnName("created_at").IsRequired();
+
+            b.HasOne(x => x.OrderLine)
+            .WithMany()
+            .HasForeignKey(x => x.OrderLineId)
+            .OnDelete(DeleteBehavior.Cascade);
+            
+            // Expiry job scans by expires_at; this index is critical for the DELETE WHERE expires_at <= NOW() to stay fast.
+            b.HasIndex(x => x.ExpiresAt).HasDatabaseName("idx_reservations_expiry");
+            // Reserve and release operations look up by order_line_id.
+            b.HasIndex(x => x.OrderLineId).HasDatabaseName("idx_reservations_order_line_id");
         });
     }
 }
