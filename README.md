@@ -11,7 +11,8 @@ Sku ─────────────────────────�
  └── InventoryAdjustment         signed audit record every time on_hand changes outside allocation
 Order ────────────────────────── one order = one allocation request from one customer
  └── OrderLine                   one line per SKU requested — qty requested vs. qty allocated
-      └── Reservation            optional soft hold on available units for a TTL window
+      ├── Reservation            optional soft hold on available units for a TTL window
+      └── AllocationEvent        immutable ledger entry written every time units move
 ```
 
 ### Sku
@@ -34,6 +35,20 @@ An `OrderLine` is the allocation unit: one line per SKU per order, with `Request
 
 A `Reservation` places a soft hold on units for a specific order line until `ExpiresAt`. The availability formula becomes `available = on_hand - reserved` (where `on_hand` already reflects committed allocations). A background job expires stale reservations. Calling reserve again for the same order replaces the existing reservation (TTL refresh).
 
+### AllocationEvent
+
+Every time units move — committed, released, or soft-held — an `AllocationEvent` row is written inside the same transaction. The table is append-only (all FKs use `RESTRICT` delete behaviour so no event can be silently removed when an order or line is deleted). `EventType` is one of five values:
+
+| Value | When written |
+|---|---|
+| `allocation_committed` | `AllocateAsync` — units moved from `on_hand` to an order line |
+| `allocation_released` | `CancelAsync` — allocated units returned to `on_hand` |
+| `reservation_created` | `ReserveAsync` — units soft-held under a TTL |
+| `reservation_released` | `ReleaseAsync` — reservation explicitly removed before TTL |
+| `reservation_expired` | `ExpireAsync` (background job) — TTL elapsed, inserted via CTE alongside the `DELETE` |
+
+`GET /orders/{id}/events` returns the full chronological event history for an order.
+
 ---
 
 ## Features
@@ -49,6 +64,7 @@ A `Reservation` places a soft hold on units for a specific order line until `Exp
 - **Reservation Release** — `POST /reservations/{id}/release` explicitly removes a reservation before it expires
 - **Reservation Expiry Job** — `ReservationExpiryJob` runs on a configurable interval (default 60 s) and deletes all rows where `expires_at <= NOW()`, restoring their quantity to availability automatically
 - **Shortage Rollup** — `GET /rollup/sku-shortages` returns a paged, shortage-descending list of SKUs where open unfulfilled demand exceeds available stock; open demand accounts for active reservations (a line covered by a reservation does not count as unmet demand); pure Dapper read with a single CTE shared between the COUNT and the paged SELECT
+- **Allocation Event Ledger** — every unit movement writes an immutable `AllocationEvent` row inside the same transaction: `AllocationCommitted` (allocate), `AllocationReleased` (cancel), `ReservationCreated` (reserve), `ReservationReleased` (explicit release), `ReservationExpired` (background job via CTE); FKs to `orders`, `order_lines`, and `skus` all use `RESTRICT` so history survives order lifecycle changes; `GET /orders/{id}/events` returns the full chronological event list
 - **Standard Envelope** — all responses use `{ success, statusCode, data, error }`; validation errors use the same shape; `[ApiController]` model-validation is overridden to produce the standard envelope instead of `ValidationProblemDetails`
 - **Structured Logging** — every write operation logs its outcome via `ILogger<T>` after the transaction commits (order created/cancelled/allocated, SKU created/adjusted, reservation reserved/released/expired); Serilog enriches every entry with `MachineName`, `ThreadId`, and `CorrelationId`
 - **Correlation ID** — `CorrelationIdMiddleware` accepts an inbound `X-Correlation-ID` header (or generates a 12-char random ID); echoes it on the response; pushes it into Serilog's `LogContext` so every log entry within the request carries it automatically
@@ -105,14 +121,18 @@ MaterialAllocationApi/
 │   ├── InventoryAdjustment.cs
 │   ├── Order.cs                            # Cancel(), RecomputeStatus() from line quantities
 │   ├── OrderLine.cs                        # Allocate(), ReleasedAllocation()
-│   └── Reservation.cs
+│   ├── Reservation.cs
+│   └── AllocationEvent.cs                  # Immutable ledger row — EventType, OrderId, OrderLineId, SkuId, Quantity, OccurredAt
 ├── Domain/Enums/
 │   ├── OrderPriority.cs
-│   └── OrderStatus.cs
+│   ├── OrderStatus.cs
+│   └── AllocationEventType.cs              # AllocationCommitted | AllocationReleased | ReservationCreated | ReservationReleased | ReservationExpired
+├── Domain/
+│   └── AllocationEventTypeExtensions.cs    # ToDbString() / FromDbString() for AllocationEventType
 ├── Models/Records/
 │   ├── SkuRecords.cs                       # CreateSkuRequest / AdjustSkuRequest / SkuResponse
 │   ├── OrderRecords.cs                     # CreateOrderRequest / OrderResponse / OrderSummaryResponse
-│   ├── AllocationRecords.cs                # AllocationResponse / AllocationLineResult / AvailabilityResponse / AllocationRunResponse / AllocationRunResult
+│   ├── AllocationRecords.cs                # AllocationResponse / AllocationLineResult / AvailabilityResponse / AllocationRunResponse / AllocationRunResult / AllocationEventResponse
 │   ├── ReservationRecords.cs               # ReserveRequest / ReservationResponse / ReservationLineResult
 │   └── RollupRecords.cs                    # SkuShortageResponse
 ├── Services/
@@ -123,10 +143,10 @@ MaterialAllocationApi/
 │   │   ├── IReservationService.cs
 │   │   └── IRollupService.cs
 │   ├── SkuService.cs                       # Create, GetById, List, AdjustAsync (optimistic concurrency)
-│   ├── OrderService.cs                     # Create, GetById, List, CancelAsync (TX + FOR UPDATE)
-│   ├── AllocationService.cs                # AllocateAsync (TX + FOR UPDATE), GetAvailabilityAsync, RunPriorityAllocationAsync
-│   ├── ReservationService.cs               # ReserveAsync (TX + FOR UPDATE), ReleaseAsync, ExpireAsync
-│   ├── ReservationExpiryJob.cs             # BackgroundService — DELETE WHERE expires_at <= NOW()
+│   ├── OrderService.cs                     # Create, GetById, List, CancelAsync (TX + FOR UPDATE); emits AllocationReleased events
+│   ├── AllocationService.cs                # AllocateAsync (TX + FOR UPDATE), GetAvailabilityAsync, RunPriorityAllocationAsync, GetEventsAsync; emits AllocationCommitted events
+│   ├── ReservationService.cs               # ReserveAsync (TX + FOR UPDATE), ReleaseAsync, ExpireAsync (CTE); emits Reservation* events
+│   ├── ReservationExpiryJob.cs             # BackgroundService — CTE: DELETE + INSERT allocation_events in one query
 │   └── RollupService.cs                    # GetSkuShortageAsync — Dapper CTE, no writes
 ├── Data/
 │   ├── AllocationDbContext.cs              # EF Core context — entity configs, indexes, CHECK constraints
@@ -328,6 +348,7 @@ Returns 409 if a concurrent modification races this request (`version` mismatch)
 | POST | `/orders/{id}/cancel` | Cancel an order and release any allocations |
 | POST | `/orders/{id}/allocate` | Allocate available stock to open order lines |
 | POST | `/orders/{id}/reserve` | Reserve available stock for each open line for a TTL |
+| GET | `/orders/{id}/events` | Full chronological allocation event history for an order |
 
 **POST `/orders` body:**
 
@@ -401,6 +422,21 @@ Reserve response:
 | `expiresAt` | DateTime | Shared expiry time for all lines in this reserve call |
 
 Per-line result includes `orderLineId`, `skuId`, `skuCode`, `quantityReserved`, and `expiresAt`.
+
+**GET `/orders/{id}/events` response:**
+
+Returns a list of `AllocationEventResponse` objects in chronological order (`occurred_at` ascending):
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | Guid | Event ID |
+| `eventType` | string | `allocation_committed`, `allocation_released`, `reservation_created`, `reservation_released`, or `reservation_expired` |
+| `orderLineId` | Guid | The order line the event applies to |
+| `skuId` | Guid | The SKU involved |
+| `quantity` | int | Units affected by this event |
+| `occurredAt` | DateTime | UTC timestamp of the event |
+
+Returns 200 with an empty list for a newly created order that has no events yet. Returns 404 if the order does not exist.
 
 **Order status codes:**
 
@@ -549,6 +585,22 @@ createdAt     DateTimeOffset
 
 Indexes: `expiresAt` (for expiry job), `orderLineId` (for reserve/release lookups)
 
+### AllocationEvent
+
+```
+id            Guid    PK
+eventType     string  allocation_committed | allocation_released | reservation_created | reservation_released | reservation_expired (max 64)
+orderId       Guid    FK → Order (restrict)
+orderLineId   Guid    FK → OrderLine (restrict)
+skuId         Guid    FK → Sku (restrict)
+quantity      int     units affected
+occurredAt    DateTimeOffset
+```
+
+All three FKs use `RESTRICT` — rows cannot be deleted if they have event history. The table is append-only; there is no update or delete path in the application.
+
+Indexes: `orderId` (primary query: all events for one order), `skuId` (cross-order audit queries by SKU), `occurredAt` (chronological range queries)
+
 ---
 
 ## Pagination
@@ -602,3 +654,4 @@ On first startup, 5 representative memory and NAND SKUs are seeded automatically
 | 8 | Shortage rollup — `GET /rollup/sku-shortages`: paged, shortage-descending list of SKUs where open demand (net of active reservations) exceeds available stock; pure Dapper CTE; 6 integration tests | Done |
 | 9 | Observability — Serilog structured logging (Console + Seq sink) with `MachineName`/`ThreadId`/`CorrelationId` enrichment; `ILogger<T>` in all services with post-commit log entries; `CorrelationIdMiddleware`; health checks (`/health`, `/health/live`, `/health/ready`) with Npgsql probe; Swagger XML doc comments and full API description | Done |
 | 10 | Priority allocation run — `POST /allocations/run` processes all open orders globally in `critical` → `high` → `standard` order (FIFO within tier); `AllocationController` + `RunPriorityAllocationAsync`; sequential execution preserves Phase 4 locking invariants; 1 integration test verifying critical order receives stock before standard | Done |
+| 11 | Allocation event ledger — `allocation_events` table with `AllocationEventType` enum (`AllocationCommitted`, `AllocationReleased`, `ReservationCreated`, `ReservationReleased`, `ReservationExpired`); events written inside existing write transactions by `AllocationService`, `OrderService`, and `ReservationService`; expiry background job uses a single CTE to DELETE reservations and INSERT expiry events atomically; all FKs use RESTRICT (immutable history); `GET /orders/{id}/events` endpoint returns full chronological event list | Done |

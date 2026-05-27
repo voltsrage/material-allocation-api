@@ -108,6 +108,10 @@ public class AllocationService : IAllocationService
                     // Both entities are tracked - SaveChangesAsync persists both atomically
                     sku.AllocateUnits(canAllocate);
                     line.Allocate(canAllocate);
+
+                    _db.AllocationEvents.Add(new AllocationEvent(
+                        AllocationEventType.AllocationCommitted, orderId, line.Id, line.SkuId, canAllocate
+                    ));
                 }
 
                 results.Add(new AllocationLineResult(
@@ -185,6 +189,32 @@ public class AllocationService : IAllocationService
             new {SkuId = skuId}
         );
         return new AvailabilityResponse(row.Id, row.SkuCode, row.OnHand, reserved, Math.Max(0, row.OnHand - reserved));
+    }
+
+    public async Task<IReadOnlyList<AllocationEventResponse>> GetEventsAsync(Guid orderId, CancellationToken ct = default)
+    {
+        _ = await _db.Orders.FirstOrDefaultAsync(o => o.Id == orderId, ct)
+            ?? throw new NotFoundException($"Order {orderId} not found!");
+
+        using var conn = await _connectionFactory.CreateAsync(ct);
+
+        var rows = await conn.QueryAsync<AllocationEventResponse>(
+            @"
+            SELECT
+                id as Id,
+                event_type as EventType,
+                order_line_id as OrderLineId,
+                sku_id as SkuId,
+                quantity as Quantity,
+                occurred_at as OccurredAt
+            FROM allocation_events
+            WHERE order_id = @orderId
+            ORDER BY occurred_at ASC
+            ",
+            new {orderId}
+        );
+
+        return rows.ToList();
     }
 
     /*

@@ -23,7 +23,23 @@ public class ReservationService : IReservationService
         using var conn = await _connectionFactory.CreateAsync(ct);
 
         var deleted = await conn.ExecuteAsync(
-            "DELETE FROM reservations WHERE expires_at <= @now",
+            @"
+            WITH expired AS(
+                DELETE FROM reservations
+                WHERE expires_at <= @now
+                RETURNING id, order_line_id, quantity
+            )
+            INSERT INTO allocation_events (event_type, order_id, order_line_id, sku_id, quantity, occurred_at)
+            SELECT
+                'reservation_expired',
+                ol.order_id,
+                e.order_line_id,
+                ol.sku_id,
+                e.quantity,
+                NOW()
+            FROM expired e
+            JOIN order_lines ol ON ol.id = e.order_line_id
+            ",
             new {now = DateTimeOffset.UtcNow}
         );
 
@@ -35,15 +51,36 @@ public class ReservationService : IReservationService
 
     public async Task ReleaseAsync(Guid reservationId, CancellationToken ct = default)
     {
-        var deleted = await _db.Database.ExecuteSqlRawAsync(
-            "DELETE FROM reservations WHERE id = @id;",
-            new NpgsqlParameter("id", reservationId)
-        );
+        // Load before deletion so we have the line and sku IDs for the event
+        var reservation = await _db.Reservations
+            .Include(r => r.OrderLine)
+            .FirstOrDefaultAsync(r => r.Id == reservationId, ct)
+            ?? throw new NotFoundException($"Reservation {reservationId} not found.");
 
-        if(deleted == 0)
-            throw new NotFoundException($"Reservation {reservationId} not found.");
+        await using var tx = await _db.Database.BeginTransactionAsync(ct);
 
-        _logger.LogInformation("Reservation {ReservationId} released.", reservationId);
+        try
+        {
+            _db.Reservations.Remove(reservation);
+
+            _db.AllocationEvents.Add(new AllocationEvent(
+                AllocationEventType.ReservationReleased,
+                reservation.OrderLine.OrderId,
+                reservation.OrderLineId,
+                reservation.OrderLine.SkuId,
+                reservation.Quantity
+            ));
+
+            await _db.SaveChangesAsync(ct);
+            await tx.CommitAsync(ct);
+
+            _logger.LogInformation("Reservation {ReservationId} released.", reservationId);
+        }
+        catch (System.Exception)
+        {
+            await TransactionHelper.RollbackAsync(tx);
+            throw;
+        }
     }
 
     public async Task<ReservationResponse> ReserveAsync(Guid orderId, ReserveRequest request, CancellationToken ct = default)
@@ -140,6 +177,10 @@ public class ReservationService : IReservationService
 
                 var skuCode = sku.SkuCode;
                 _db.Reservations.Add(new Reservation(line.Id, (int)canReserve, expiresAt));
+
+                _db.AllocationEvents.Add(new AllocationEvent(
+                        AllocationEventType.AllocationCommitted, orderId, line.Id, line.SkuId, (int)canReserve
+                    ));
 
                 results.Add(new ReservationLineResult(
                     line.Id, line.SkuId, skuCode, (int)canReserve, expiresAt.UtcDateTime));

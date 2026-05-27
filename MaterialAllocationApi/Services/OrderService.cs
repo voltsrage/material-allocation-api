@@ -95,9 +95,14 @@ public class OrderService : IOrderService
                     ?? throw new InvalidOperationException(
                         $"SKU {line.SkuId} referenced by order line {line.Id} not found."
                     );
-
+                
+                var releasedQty = line.AllocatedQty;
                 sku.ReleaseUnits(line.AllocatedQty);
                 line.ReleasedAllocation();
+
+                _db.AllocationEvents.Add(new AllocationEvent(
+                        AllocationEventType.AllocationCommitted, id, line.Id, line.SkuId, releasedQty
+                    ));
             }
 
             var allLineIds = order.Lines.Select(l => l.Id).ToArray();

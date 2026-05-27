@@ -117,4 +117,17 @@ public class OrdersController : ControllerBase
         var result = await _reservations.ReserveAsync(id, request, ct);
         return Ok(ApiResponse<ReservationResponse>.Ok(result));
     }
+
+    /// <summary>Returns the full allocation audit history for an order in chronological order.</summary>
+    /// <response code="200">Event list (may be empty for a newly created order).</response>
+    /// <response code="404">Order not found.</response>
+    [HttpGet("{id:guid}/events")]
+    [ProducesResponseType(typeof(ApiResponse<IReadOnlyList<AllocationEventResponse>>), 200)]
+    [ProducesResponseType(typeof(ApiResponse<object>), 404)]
+    public async Task<ActionResult<ApiResponse<IReadOnlyList<AllocationEventResponse>>>> GetEvents(Guid id, CancellationToken ct)
+    {
+        var events = await _allocation.GetEventsAsync(id, ct);
+        
+        return Ok(ApiResponse<IReadOnlyList<AllocationEventResponse>>.Ok(events));
+    }
 }

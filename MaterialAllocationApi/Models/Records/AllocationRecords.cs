@@ -35,3 +35,12 @@ public record AllocationRunResult
     string Status,
     bool IsFullyAllocated
 );
+
+public record AllocationEventResponse(
+    Guid Id,
+    string EventType,
+    Guid OrderLineId,
+    Guid SkuId,
+    int Quantity,
+    DateTime OccurredAt
+);

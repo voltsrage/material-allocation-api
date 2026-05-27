@@ -10,6 +10,7 @@ public class AllocationDbContext : DbContext
     public DbSet<Order> Orders => Set<Order>();
     public DbSet<OrderLine> OrderLines => Set<OrderLine>();
     public DbSet<Reservation> Reservations => Set<Reservation>();
+    public DbSet<AllocationEvent> AllocationEvents => Set<AllocationEvent>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -126,6 +127,38 @@ public class AllocationDbContext : DbContext
             b.HasIndex(x => x.ExpiresAt).HasDatabaseName("idx_reservations_expiry");
             // Reserve and release operations look up by order_line_id.
             b.HasIndex(x => x.OrderLineId).HasDatabaseName("idx_reservations_order_line_id");
+        });
+
+        modelBuilder.Entity<AllocationEvent>(b =>
+        {
+            b.ToTable("allocation_events");
+            b.HasKey(x => x.Id);
+            b.Property(x => x.Id).HasColumnName("id").HasDefaultValueSql("gen_random_uuid()");
+            b.Property(x => x.EventType).HasColumnName("event_type").HasMaxLength(64).IsRequired()
+                .HasConversion(
+                    v => v.ToDbString(),
+                    v => AllocationEventTypeExtensions.FromDbString(v));
+            b.Property(x => x.OrderId).HasColumnName("order_id").IsRequired();
+            b.Property(x => x.OrderLineId).HasColumnName("order_line_id").IsRequired();
+            b.Property(x => x.SkuId).HasColumnName("sku_id").IsRequired();
+            b.Property(x => x.Quantity).HasColumnName("quantity").IsRequired();
+            b.Property(x => x.OccurredAt).HasColumnName("occurred_at").IsRequired();
+
+            // RESTRICT: prevents deleting an order or line that has audit history.
+            // This is intentional — the ledger is immutable; orders are never hard-deleted in this system.
+            b.HasOne<Order>().WithMany().HasForeignKey(x => x.OrderId)
+                .OnDelete(DeleteBehavior.Restrict);
+            b.HasOne<OrderLine>().WithMany().HasForeignKey(x => x.OrderLineId)
+                .OnDelete(DeleteBehavior.Restrict);
+            b.HasOne<Sku>().WithMany().HasForeignKey(x => x.SkuId)
+                .OnDelete(DeleteBehavior.Restrict);
+
+            // Primary query pattern: load the full event history for one order
+            b.HasIndex(x => x.OrderId).HasDatabaseName("idx_allocation_events_order_id");
+            // Secondary: audit queries filtering by SKU across all orders
+            b.HasIndex(x => x.SkuId).HasDatabaseName("idx_allocation_events_sku_id");
+            // Chronological reporting queries
+            b.HasIndex(x => x.OccurredAt).HasDatabaseName("idx_allocation_events_occurred_at");
         });
     }
 }
