@@ -20,3 +20,18 @@ public record AvailabilityResponse(
     int Reserved, // 0 until Phase 7 adds the reservations table
     int Available // OnHand, Reserved; on_hand already reflects committed allocations
 );
+
+public record AllocationRunResponse(
+    int OrdersProcessed,
+    int OrdersFullyAllocated,
+    int OrdersPartiallyAllocated,
+    IReadOnlyList<AllocationRunResult> Results
+);
+public record AllocationRunResult
+(
+    Guid OrderId,
+    string ReferenceCode,
+    string Priority,
+    string Status,
+    bool IsFullyAllocated
+);

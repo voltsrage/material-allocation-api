@@ -43,6 +43,7 @@ A `Reservation` places a soft hold on units for a specific order line until `Exp
 - **Availability Query** — `GET /skus/{id}/availability` returns `on_hand`, `reserved`, and `available = on_hand - reserved` in one read
 - **Order Management** — create orders with one or more lines referencing existing SKUs; paginated list with optional `status` filter; unique `reference_code` enforced at DB level
 - **Allocation Run** — `POST /orders/{id}/allocate` fills open lines against current stock in a single transaction; pessimistic `SELECT … FOR UPDATE` on SKU rows in deterministic (sku_id ascending) order prevents deadlocks; partial allocation allowed — unfulfilled lines remain open; response states partial vs. full explicitly
+- **Priority Allocation Run** — `POST /allocations/run` processes every non-terminal order in a single call, in priority order (`critical` → `high` → `standard`); within a tier, older orders are served first (FIFO); each order allocates in its own transaction so all Phase 4 locking invariants hold; returns aggregated stats (`ordersProcessed`, `ordersFullyAllocated`, `ordersPartiallyAllocated`) plus a per-order result list
 - **Cancellation & Release** — `POST /orders/{id}/cancel` transitions the order to `cancelled` and atomically restores `on_hand` from each line's `allocated_qty`; cancel uses the same lock order as allocate to prevent concurrent allocation/cancel deadlocks
 - **Reservations** — `POST /orders/{id}/reserve` places a TTL-bounded hold per line against available stock; own-order reservation does not block own allocation; calling reserve again replaces the existing hold (idempotent TTL refresh)
 - **Reservation Release** — `POST /reservations/{id}/release` explicitly removes a reservation before it expires
@@ -96,6 +97,7 @@ MaterialAllocationApi/
 ├── Controllers/
 │   ├── SkusController.cs                   # Create, get, list, adjust, availability
 │   ├── OrdersController.cs                 # Create, get, list, cancel, allocate, reserve
+│   ├── AllocationController.cs             # POST /allocations/run — global priority run
 │   ├── ReservationsController.cs           # Release
 │   └── RollupController.cs                 # GET sku-shortages
 ├── Domain/Entities/
@@ -110,7 +112,7 @@ MaterialAllocationApi/
 ├── Models/Records/
 │   ├── SkuRecords.cs                       # CreateSkuRequest / AdjustSkuRequest / SkuResponse
 │   ├── OrderRecords.cs                     # CreateOrderRequest / OrderResponse / OrderSummaryResponse
-│   ├── AllocationRecords.cs                # AllocationResponse / AllocationLineResult / AvailabilityResponse
+│   ├── AllocationRecords.cs                # AllocationResponse / AllocationLineResult / AvailabilityResponse / AllocationRunResponse / AllocationRunResult
 │   ├── ReservationRecords.cs               # ReserveRequest / ReservationResponse / ReservationLineResult
 │   └── RollupRecords.cs                    # SkuShortageResponse
 ├── Services/
@@ -122,7 +124,7 @@ MaterialAllocationApi/
 │   │   └── IRollupService.cs
 │   ├── SkuService.cs                       # Create, GetById, List, AdjustAsync (optimistic concurrency)
 │   ├── OrderService.cs                     # Create, GetById, List, CancelAsync (TX + FOR UPDATE)
-│   ├── AllocationService.cs                # AllocateAsync (TX + FOR UPDATE), GetAvailabilityAsync
+│   ├── AllocationService.cs                # AllocateAsync (TX + FOR UPDATE), GetAvailabilityAsync, RunPriorityAllocationAsync
 │   ├── ReservationService.cs               # ReserveAsync (TX + FOR UPDATE), ReleaseAsync, ExpireAsync
 │   ├── ReservationExpiryJob.cs             # BackgroundService — DELETE WHERE expires_at <= NOW()
 │   └── RollupService.cs                    # GetSkuShortageAsync — Dapper CTE, no writes
@@ -149,7 +151,7 @@ MaterialAllocationApi.Tests/
 ├── Helpers/
 │   └── AllocationTestBase.cs               # HTTP helpers (CreateSkuAsync, CreateOrderAsync, AllocateAsync, …); DB assertion helpers
 ├── Allocation/
-│   ├── AllocationFlowTests.cs              # Partial allocation, sequential top-up, over-demand
+│   ├── AllocationFlowTests.cs              # Partial allocation, sequential top-up, over-demand, priority run (critical before standard)
 │   ├── ConcurrentAllocationTests.cs        # Two parallel allocates on the same SKU — exactly one wins
 │   ├── CancelTests.cs                      # Cancel + inventory restoration; cancel with no allocations
 │   └── ReservationTests.cs                 # Reserve, block, own-order exception, TTL refresh, release, expiry, cancel-deletes
@@ -182,6 +184,10 @@ available = on_hand - reserved
 ### Reservations inside the allocation lock
 
 `ReserveAsync` acquires the same `FOR UPDATE` lock on SKU rows before reading reservation totals from other orders. This guarantees that the reservation count read inside the transaction sees the latest committed state — no concurrent reserve or allocate can insert a new reservation for these SKUs between the lock acquisition and the commit.
+
+### Sequential priority ordering in the allocation run
+
+`RunPriorityAllocationAsync` fetches all non-terminal orders sorted by priority (`critical` = 0, `high` = 1, `standard` = 2) then `CreatedAt`, and calls `AllocateAsync` for each sequentially. Running allocations in parallel would re-introduce the circular-wait risk that the deterministic lock order prevents within a single allocation — and would make priority ordering meaningless, since a `standard` order could grab stock before a `critical` order's transaction commits. Sequential processing is the simplest correct model at expected batch sizes; each call acquires and releases its own `FOR UPDATE` locks independently, so all Phase 4 invariants hold without modification.
 
 ### EF Core + Dapper together
 
@@ -418,6 +424,43 @@ Returns 204 on success, 404 if the reservation does not exist.
 
 ---
 
+### Allocations
+
+| Method | Path | Description |
+|---|---|---|
+| POST | `/allocations/run` | Run priority-aware allocation across all open orders |
+
+**POST `/allocations/run`**
+
+No request body required. Processes all orders with status `open` or `partially_allocated` in priority order (`critical` → `high` → `standard`); within a tier, older orders are served first. Each order runs through its own transaction using the same `SELECT … FOR UPDATE` locking as `POST /orders/{id}/allocate`. Orders that become terminal (cancelled or fully allocated by a concurrent request) between the initial query and the lock are skipped gracefully.
+
+Response:
+
+| Field | Type | Description |
+|---|---|---|
+| `ordersProcessed` | int | Total orders evaluated in this run |
+| `ordersFullyAllocated` | int | Orders whose status is `fully_allocated` after this run |
+| `ordersPartiallyAllocated` | int | Orders that received some stock but still have open lines |
+| `results` | array | Per-order result (see below) |
+
+Per-order result:
+
+| Field | Type | Description |
+|---|---|---|
+| `orderId` | Guid | Order ID |
+| `referenceCode` | string | Order reference code |
+| `priority` | string | `standard`, `high`, or `critical` |
+| `status` | string | Order status after this run |
+| `isFullyAllocated` | bool | Whether all lines are now satisfied |
+
+**Status codes:**
+
+| Code | Meaning |
+|---|---|
+| 200 | Run complete — inspect per-order `results` for individual outcomes |
+
+---
+
 ### Rollup
 
 | Method | Path | Description |
@@ -558,3 +601,4 @@ On first startup, 5 representative memory and NAND SKUs are seeded automatically
 | 7 | Reservations — `reservations` table, `POST /orders/{id}/reserve` (TX + FOR UPDATE, TTL refresh), `POST /reservations/{id}/release`, `ReservationExpiryJob` background worker; allocate and cancel respect reservations | Done |
 | 8 | Shortage rollup — `GET /rollup/sku-shortages`: paged, shortage-descending list of SKUs where open demand (net of active reservations) exceeds available stock; pure Dapper CTE; 6 integration tests | Done |
 | 9 | Observability — Serilog structured logging (Console + Seq sink) with `MachineName`/`ThreadId`/`CorrelationId` enrichment; `ILogger<T>` in all services with post-commit log entries; `CorrelationIdMiddleware`; health checks (`/health`, `/health/live`, `/health/ready`) with Npgsql probe; Swagger XML doc comments and full API description | Done |
+| 10 | Priority allocation run — `POST /allocations/run` processes all open orders globally in `critical` → `high` → `standard` order (FIFO within tier); `AllocationController` + `RunPriorityAllocationAsync`; sequential execution preserves Phase 4 locking invariants; 1 integration test verifying critical order receives stock before standard | Done |

@@ -87,6 +87,13 @@ public abstract class AllocationTestBase : IAsyncLifetime
         return (response.StatusCode, envelope);
     }
 
+    protected async Task<OrderResponse> GetOrderAsync(Guid orderId)
+    {
+        var response = await Client.GetAsync($"/api/v1/orders/{orderId}");
+        response.EnsureSuccessStatusCode();
+        return await ReadAsync<OrderResponse>(response);
+    }
+
     protected async Task AdjustSkuAsync(Guid skuId, int delta, string reason)
     {
         var response = await Client.PostAsJsonAsync($"/api/v1/skus/{skuId}/adjust", new { delta, reason });

@@ -187,5 +187,62 @@ public class AllocationService : IAllocationService
         return new AvailabilityResponse(row.Id, row.SkuCode, row.OnHand, reserved, Math.Max(0, row.OnHand - reserved));
     }
 
+    /*
+    Running allocations in parallel would re-introduce the deadlock risk that Phase 4's deterministic lock order was designed to prevent. Priority ordering is meaningless if a `Standard` order and a `Critical` order race concurrently for the same SKU — the `Critical` order must complete first so its allocation is committed before `Standard` sees the remaining quantity. Sequential processing in sorted order is the correct model here.
+    */
+    public async Task<AllocationRunResponse> RunPriorityAllocationAsync(CancellationToken ct = default)
+    {
+        // Fetch all the order that are not fully allocated
+        // or cancelled, ordered so that 'Critical' comes first, then 'High', then 'Standard', within a tier, older orders are processed first.
+        var openOrders = await _db.Orders
+            .Include(o => o.Lines)
+            .Where(o => o.Status != OrderStatus.FullyAllocated && o.Status != OrderStatus.Cancelled)
+            .OrderBy(o => o.Priority == OrderPriority.Critical ? 0 :
+                o.Priority == OrderPriority.High ? 1 : 2)
+            .ThenBy(o => o.CreatedAt)
+            .ToListAsync();
+
+        // Each order runs through the existing 'AllocateAsync' logic
+        // Sequencing is enforced at the application layer - no database-level priority mechanism is needed.
+        // Because each call acquires its own 'FOR UPDATE' locks an commits independently,
+        // the invariants from Phase 4 hold exactly as before.
+
+        var results = new List<AllocationRunResult>();
+
+        foreach(var order in openOrders)
+        {
+            try
+            {
+                var result = await AllocateAsync(order.Id, ct);
+                results.Add(new AllocationRunResult(
+                    order.Id,
+                    order.ReferenceCode,
+                    order.Priority.ToDbString(),
+                    result.Status,
+                    result.IsFullyAllocated
+                ));
+            }
+            catch (ConflictException)
+            {
+                // ORDER_FULLY_ALLOCATED or ORDER_CANCELLED between the query above and the lock.
+                // Safe to skip - the order's status in the DB is already terminal.
+                results.Add(new AllocationRunResult(
+                    order.Id,
+                    order.ReferenceCode,
+                    order.Priority.ToDbString(),
+                    order.Status.ToDbString(),
+                    order.Status == OrderStatus.FullyAllocated
+                ));
+            }
+        }
+
+        return new AllocationRunResponse(
+            OrdersProcessed: results.Count,
+            OrdersFullyAllocated: results.Count(r => r.IsFullyAllocated),
+            OrdersPartiallyAllocated: results.Count(r => !r.IsFullyAllocated),
+            Results: results
+        );
+    }
+
     private record SkuAvailRow(Guid Id, string SkuCode, int OnHand);
 }
