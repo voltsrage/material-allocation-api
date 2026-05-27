@@ -56,6 +56,8 @@ try
     builder.Services.AddScoped<IEventPublisher, LoggingEventPublisher>();
     builder.Services.AddHostedService<OutboxRelayJob>();
 
+    builder.Services.AddHostedService<IdempotencyCleanupJob>();
+
     var authSettings = builder.Configuration
         .GetSection("Authentication")
         .Get<AuthSettings>()!;
@@ -111,6 +113,10 @@ try
 
     builder.Services.AddAuthorization();
 
+    builder.Services.Configure<IdempotencySettings>(
+        builder.Configuration.GetSection("Idempotency")
+    );
+
     builder.Services.AddControllers()
         .AddJsonOptions(o =>
             o.JsonSerializerOptions.Converters.Add(
@@ -157,6 +163,8 @@ try
                 new List<string>()
             }
         });
+
+        options.OperationFilter<IdempotencyHeaderOperationFilter>();
 
         // Group operations under their controller tags.
         options.TagActionsBy(api => [api.GroupName ?? api.ActionDescriptor.RouteValues["controller"]!]); 
@@ -230,7 +238,7 @@ try
 
     app.UseAuthentication();
     app.UseAuthorization();
-
+    app.UseMiddleware<IdempotencyMiddleware>();
     app.MapControllers();
     app.MapHealthChecks("/health", new HealthCheckOptions
     {

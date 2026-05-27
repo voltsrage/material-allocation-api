@@ -66,6 +66,7 @@ Every time units move — committed, released, or soft-held — an `AllocationEv
 - **Shortage Rollup** — `GET /rollup/sku-shortages` returns a paged, shortage-descending list of SKUs where open unfulfilled demand exceeds available stock; open demand accounts for active reservations (a line covered by a reservation does not count as unmet demand); pure Dapper read with a single CTE shared between the COUNT and the paged SELECT
 - **Allocation Event Ledger** — every unit movement writes an immutable `AllocationEvent` row inside the same transaction: `AllocationCommitted` (allocate), `AllocationReleased` (cancel), `ReservationCreated` (reserve), `ReservationReleased` (explicit release), `ReservationExpired` (background job via CTE); FKs to `orders`, `order_lines`, and `skus` all use `RESTRICT` so history survives order lifecycle changes; `GET /orders/{id}/events` returns the full chronological event list
 - **Transactional Outbox** — every write that produces a domain event appends an `OutboxMessage` row (event type + JSON payload) inside the same EF Core `SaveChangesAsync` call as the business write, guaranteeing the two are atomic; `OutboxRelayJob` (`BackgroundService`) polls the table on a configurable interval, delivers each message via `IEventPublisher`, and marks it `processed_at`; failures are recorded in `error` (leaving `processed_at` null) so the row stays eligible for the next relay pass; `OutboxLagHealthCheck` surfaces degraded status when the oldest unprocessed message is older than two minutes; current publisher implementation is `LoggingEventPublisher` — drop-in replacement for any real transport (Kafka, SNS, etc.)
+- **Idempotency** — optional `Idempotency-Key` header (max 128 chars; UUID v4 recommended) on any `POST` endpoint (except `/api/v1/auth/token`); `IdempotencyMiddleware` inserts a `processing` record using a database unique constraint as the atomic lock — a duplicate-key violation on a concurrent request returns `409 IDEMPOTENCY_IN_FLIGHT`; once the upstream response is buffered, 2xx and 4xx outcomes are stored and replayed on subsequent requests with the same key (5xx outcomes are not stored so the client can safely retry); replayed responses carry `X-Idempotency-Replayed: true`; reusing a key for a different path returns `422 IDEMPOTENCY_KEY_MISMATCH`; `IdempotencyCleanupJob` (`BackgroundService`) purges expired `complete` records and stuck `processing` records on a configurable interval; Swagger UI exposes the header on all qualifying `POST` operations via `IdempotencyHeaderOperationFilter`
 - **JWT Authentication** — `POST /api/v1/auth/token` issues a signed JWT for a requested role (development-use endpoint; in production, tokens come from your identity provider); JWT Bearer validation is wired in `Program.cs`; all controllers carry `[Authorize]` at the class level; unauthenticated requests return a standard-envelope `401`; forbidden role combinations return `403`
 - **Role-Based Access Control (RBAC)** — four roles enforced via `[Authorize(Roles = "...")]` at the action level: `warehouse-ops` (create SKU, adjust inventory), `sales-ops` (create order, cancel order), `allocation-manager` (allocate, reserve, release reservation, run global allocation), `read-only` (all GET endpoints — no specific role required beyond authentication); `POST /api/v1/auth/token` is `[AllowAnonymous]`
 - **Standard Envelope** — all responses use `{ success, statusCode, data, error }`; validation errors use the same shape; `[ApiController]` model-validation is overridden to produce the standard envelope instead of `ValidationProblemDetails`
@@ -85,6 +86,8 @@ HTTP request
   → CorrelationIdMiddleware    (assigns / echoes X-Correlation-ID; pushes CorrelationId into Serilog LogContext)
   → ExceptionHandlerMiddleware (maps domain exceptions to standard envelope; logs warnings/errors with request path)
   → Serilog request logging    (one structured log line per request: method, path, status, elapsed, correlation ID)
+  → IdempotencyMiddleware      (POST-only; claims key via DB unique constraint; replays stored 2xx/4xx on duplicate;
+                                 buffers response body; skips /api/v1/auth/token)
   → UseAuthentication          (JWT Bearer validation; 401 on missing/invalid token)
   → UseAuthorization           (role check; 403 on insufficient role)
   → Controllers
@@ -94,8 +97,9 @@ HTTP request
   → PostgreSQL
 
 Background workers
-  → ReservationExpiryJob  (expires stale reservations; inserts reservation_expired events via CTE)
-  → OutboxRelayJob        (polls outbox_messages; delivers via IEventPublisher; marks processed_at or error)
+  → ReservationExpiryJob     (expires stale reservations; inserts reservation_expired events via CTE)
+  → OutboxRelayJob           (polls outbox_messages; delivers via IEventPublisher; marks processed_at or error)
+  → IdempotencyCleanupJob    (deletes expired 'complete' records and stuck 'processing' records)
 ```
 
 Services are the only layer that touches the database. Controllers translate HTTP concerns (query params, status codes, response envelope) and delegate all business logic to the service layer. EF Core handles writes, aggregate loads, and raw-SQL locking queries; Dapper is used for multi-result read queries (order details with lines, paginated lists) where the result shape doesn't map cleanly to aggregate roots.
@@ -135,7 +139,8 @@ MaterialAllocationApi/
 │   ├── OrderLine.cs                        # Allocate(), ReleasedAllocation()
 │   ├── Reservation.cs
 │   ├── AllocationEvent.cs                  # Immutable ledger row — EventType, OrderId, OrderLineId, SkuId, Quantity, OccurredAt
-│   └── OutboxMessage.cs                    # processing / complete state; MarkProcessed(), MarkFailed(error)
+│   ├── OutboxMessage.cs                    # processing / complete state; MarkProcessed(), MarkFailed(error)
+│   └── IdempotencyRecord.cs               # IdempotencyKey, RequestPath, Status (processing|complete), ResponseStatus, ResponseBody, ExpiresAt; Complete()
 ├── Domain/Enums/
 │   ├── OrderPriority.cs
 │   ├── OrderStatus.cs
@@ -166,7 +171,8 @@ MaterialAllocationApi/
 │   ├── RollupService.cs                    # GetSkuShortageAsync — Dapper CTE, no writes
 │   ├── EventPublisher.cs                   # LoggingEventPublisher: logs event type + payload; swap for Kafka/SNS in production
 │   ├── OutboxRelayJob.cs                   # BackgroundService — polls outbox_messages; delivers via IEventPublisher; marks processed_at or error
-│   └── JwtTokenService.cs                  # IssueToken — HMAC-SHA256 signed JWT with role claim; expiry from AuthSettings
+│   ├── JwtTokenService.cs                  # IssueToken — HMAC-SHA256 signed JWT with role claim; expiry from AuthSettings
+│   └── IdempotencyCleanupJob.cs            # BackgroundService — deletes expired 'complete' records and stuck 'processing' records
 ├── Data/
 │   ├── AllocationDbContext.cs              # EF Core context — entity configs, indexes, CHECK constraints; OutboxMessages DbSet
 │   ├── IDbConnectionFactory.cs / NpgsqlConnectionFactory.cs
@@ -178,17 +184,21 @@ MaterialAllocationApi/
 │   ├── Helper.cs                           # Helpers.Serialize(obj) — camelCase JSON serializer used by outbox payload builders
 │   ├── Config/
 │   │   ├── AuthSettings.cs                 # JwtSecret, Issuer, Audience, TokenExpiryMinutes
-│   │   └── OutboxRelaySettings.cs          # IntervalSeconds, BatchSize
+│   │   ├── OutboxRelaySettings.cs          # IntervalSeconds, BatchSize
+│   │   └── IdempotencySettings.cs          # ExpiryHours, CleanupIntervalSeconds, StuckProcessingAgeMinutes
 │   ├── Health/
 │   │   └── OutboxLagHealthCheck.cs         # Degraded when oldest unprocessed outbox message > 2 minutes old
+│   ├── Swagger/
+│   │   └── IdempotencyHeaderOperationFilter.cs  # Adds optional Idempotency-Key header to all POST operations in Swagger UI
 │   └── Exceptions/
 │       ├── NotFoundException.cs
 │       ├── ConflictException.cs
 │       └── ValidationException.cs
 ├── Middleware/
 │   ├── CorrelationIdMiddleware.cs          # Assigns/echoes X-Correlation-ID; pushes into Serilog LogContext
-│   └── ExceptionHandlerMiddleware.cs       # Maps domain exceptions to standard envelope + status codes; logs with request path
-└── Migrations/                             # EF Core migration history (includes AddOutboxMessages)
+│   ├── ExceptionHandlerMiddleware.cs       # Maps domain exceptions to standard envelope + status codes; logs with request path
+│   └── IdempotencyMiddleware.cs            # Atomic key claim via DB unique constraint; response buffering; replay on duplicate
+└── Migrations/                             # EF Core migration history (includes AddIdempotencyKeys)
 
 MaterialAllocationApi.Tests/
 ├── Fixtures/
@@ -250,6 +260,12 @@ EF Core owns writes (aggregate mutations, reservation inserts) and raw-SQL locki
 
 Migrations run under `material_allocation_migrator` (DDL privileges). The app runs as `dotnetter` (DML-only: `SELECT`, `INSERT`, `UPDATE`, `DELETE`). A compromised app process cannot drop or alter tables. `ALTER DEFAULT PRIVILEGES FOR ROLE material_allocation_migrator` ensures new tables automatically grant DML to `dotnetter`.
 
+### Idempotency via database unique constraint
+
+`IdempotencyMiddleware` uses the `idempotency_keys` table's unique index on `idempotency_key` as the atomic lock rather than application-level compare-and-set. On the first request, the middleware inserts a `processing` record. If a second request with the same key races in before the first completes, the `INSERT` fails with a unique-constraint violation, which is caught and converted to `409 IDEMPOTENCY_IN_FLIGHT`. This approach is correct under any level of horizontal scaling without requiring a distributed lock.
+
+The response is buffered in memory (`MemoryStream`) so it can be both written to the client and stored in the database in a single pass. Only `2xx` and `4xx` outcomes are persisted — `5xx` responses may be transient, so the record stays in `processing` state and is cleaned up by `IdempotencyCleanupJob` after the configured `StuckProcessingAgeMinutes` threshold, leaving the client free to retry. The middleware is inserted between `ExceptionHandlerMiddleware` and authentication so that the idempotency check happens on all authenticated mutations without being bypassed by the exception handler.
+
 ---
 
 ## Getting Started
@@ -288,6 +304,11 @@ Edit `appsettings.json`:
     "Issuer": "material-allocation-api",
     "Audience": "material-allocation-clients",
     "TokenExpiryMinutes": 60
+  },
+  "Idempotency": {
+    "ExpiryHours": 24,
+    "CleanupIntervalSeconds": 3600,
+    "StuckProcessingAgeMinutes": 5
   }
 }
 ```
@@ -603,6 +624,33 @@ In production, replace this endpoint with tokens issued by your identity provide
 
 ---
 
+### Idempotency
+
+Idempotency is opt-in via the `Idempotency-Key` request header. It applies to all `POST` endpoints except `/api/v1/auth/token`.
+
+**Header:**
+
+| Header | Required | Description |
+|---|---|---|
+| `Idempotency-Key` | no | Client-generated unique key (max 128 chars; UUID v4 recommended) |
+
+**Behaviour:**
+
+| Scenario | Status | Body |
+|---|---|---|
+| First request with this key | — | Normal response |
+| Same key, same path, request still in flight | 409 | `IDEMPOTENCY_IN_FLIGHT` |
+| Same key, same path, already completed | `<original status>` | Original response body; `X-Idempotency-Replayed: true` header added |
+| Same key, different path | 422 | `IDEMPOTENCY_KEY_MISMATCH` |
+| Key present but empty or > 128 chars | 422 | `VALIDATION_ERROR` |
+| No header | — | Request passes through; no idempotency applied |
+
+Only `2xx` and `4xx` responses are stored. `5xx` responses are **not** stored — the `processing` record is left in place and cleaned up by `IdempotencyCleanupJob` after `StuckProcessingAgeMinutes` (default 5 min), allowing the client to retry safely.
+
+**Stored records expire after `Idempotency:ExpiryHours` (default 24 h).** `IdempotencyCleanupJob` deletes expired `complete` records and stuck `processing` records on each `CleanupIntervalSeconds` tick (default 3600 s / 1 h).
+
+---
+
 ## Data Models
 
 ### Sku
@@ -690,6 +738,22 @@ error        string?           last relay error message; set on publisher failur
 
 `OutboxRelayJob` polls `WHERE processed_at IS NULL ORDER BY created_at` in batches of `OutboxRelaySettings.BatchSize` (default 50). The relay writes both `processed_at` and `error` updates in a single `SaveChangesAsync` call after processing the batch.
 
+### IdempotencyRecord
+
+```
+id              Guid            PK (gen_random_uuid())
+idempotencyKey  string          required, unique (max 128) — unique index used as atomic lock
+requestPath     string          path the key was first used on (max 500)
+requestMethod   string          HTTP method (max 10)
+status          string          processing | complete
+responseStatus  int?            HTTP status code of the stored response (null while processing)
+responseBody    jsonb?          full response JSON body (null while processing)
+createdAt       DateTimeOffset  inserted when the key is first claimed
+expiresAt       DateTimeOffset  createdAt + IdempotencySettings.ExpiryHours (default 24 h)
+```
+
+Indexes: `idempotencyKey` unique (primary concurrency guard), `expiresAt` (cleanup job range scan)
+
 ---
 
 ## Pagination
@@ -746,3 +810,4 @@ On first startup, 5 representative memory and NAND SKUs are seeded automatically
 | 11 | Allocation event ledger — `allocation_events` table with `AllocationEventType` enum (`AllocationCommitted`, `AllocationReleased`, `ReservationCreated`, `ReservationReleased`, `ReservationExpired`); events written inside existing write transactions by `AllocationService`, `OrderService`, and `ReservationService`; expiry background job uses a single CTE to DELETE reservations and INSERT expiry events atomically; all FKs use RESTRICT (immutable history); `GET /orders/{id}/events` endpoint returns full chronological event list | Done |
 | 12 | Transactional outbox — `outbox_messages` table (`event_type`, `payload jsonb`, `processed_at`, `error`); `OutboxMessage` entity with `MarkProcessed()` / `MarkFailed(error)`; outbox row written inside the same `SaveChangesAsync` as every domain write (allocation, cancel, reserve, release, expiry); `OutboxRelayJob` `BackgroundService` polls unprocessed rows in batches, publishes via `IEventPublisher`, marks `processed_at` on success or records `error` on failure; `LoggingEventPublisher` logs event + payload (drop-in for Kafka/SNS); `OutboxLagHealthCheck` reports degraded when oldest unprocessed message > 2 min; 8 integration tests covering write, relay, failure recording, and atomicity | Done |
 | 13 | JWT auth + RBAC — `POST /api/v1/auth/token` (`[AllowAnonymous]`) issues HMAC-SHA256 signed JWTs for a requested role; JWT Bearer validation in `Program.cs`; `[Authorize]` on all controllers; four role-restricted scopes: `warehouse-ops` (SKU writes), `sales-ops` (order create/cancel), `allocation-manager` (allocate, reserve, release, run), read-only GET access requires only authentication; `TestAuthHandler` in test project replaces JWT validation with `X-Test-Role` header; `AuthorizeAs()` / `AuthorizeAsAll()` helpers on `AllocationTestBase`; 19 RBAC integration tests covering 401, 403, and 2xx for all roles | Done |
+| 14 | Idempotency — `idempotency_keys` table with unique index on `idempotency_key`; `IdempotencyMiddleware` claims keys via atomic DB insert; buffers 2xx/4xx responses and replays them on duplicate requests with `X-Idempotency-Replayed: true`; `409 IDEMPOTENCY_IN_FLIGHT` on concurrent in-flight duplicates; `422 IDEMPOTENCY_KEY_MISMATCH` on path reuse; 5xx outcomes not stored (client-retry safe); `IdempotencyCleanupJob` purges expired `complete` records and stuck `processing` records; `IdempotencySettings` (`ExpiryHours`, `CleanupIntervalSeconds`, `StuckProcessingAgeMinutes`); `IdempotencyHeaderOperationFilter` exposes optional header on all qualifying `POST` operations in Swagger UI | Done |

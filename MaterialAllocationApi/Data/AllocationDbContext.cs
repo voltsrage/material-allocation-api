@@ -12,6 +12,7 @@ public class AllocationDbContext : DbContext
     public DbSet<Reservation> Reservations => Set<Reservation>();
     public DbSet<AllocationEvent> AllocationEvents => Set<AllocationEvent>();
     public DbSet<OutboxMessage> OutboxMessages => Set<OutboxMessage>();
+    public DbSet<IdempotencyRecord> IdempotencyRecords => Set<IdempotencyRecord>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -179,6 +180,30 @@ public class AllocationDbContext : DbContext
             b.HasIndex(x => x.CreatedAt)
                 .HasFilter("processed_at IS NULL")
                 .HasDatabaseName("idx_outbox_messages_unprocessed");
+        });
+
+        modelBuilder.Entity<IdempotencyRecord>(b =>
+        {
+            b.ToTable("idempotency_keys");
+            b.HasKey(x => x.Id);
+            b.Property(x => x.Id).HasColumnName("id").HasDefaultValueSql("gen_random_uuid()");
+            b.Property(x => x.IdempotencyKey).HasColumnName("idempotency_key").HasMaxLength(128).IsRequired();
+            b.Property(x => x.RequestPath).HasColumnName("request_path").HasMaxLength(500).IsRequired();
+            b.Property(x => x.RequestMethod).HasColumnName("request_method").HasMaxLength(10).IsRequired();
+            b.Property(x => x.Status).HasColumnName("status").HasMaxLength(32).IsRequired();
+            b.Property(x => x.ResponseStatus).HasColumnName("response_status");
+            b.Property(x => x.ResponseBody).HasColumnName("response_body").HasColumnType("jsonb");
+            b.Property(x => x.CreatedAt).HasColumnName("created_at").IsRequired();
+            b.Property(x => x.ExpiresAt).HasColumnName("expires_at").IsRequired();
+
+            // The key lookup and uniqueness constraint — the primary query pattern.
+            b.HasIndex(x => x.IdempotencyKey)
+                .IsUnique()
+                .HasDatabaseName("idx_idempotency_keys_key");
+
+            // Cleanup job scans by expires_at.
+            b.HasIndex(x => x.ExpiresAt)
+                .HasDatabaseName("idx_idempotency_keys_expiry");
         });
     }
 }
