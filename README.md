@@ -65,6 +65,9 @@ Every time units move — committed, released, or soft-held — an `AllocationEv
 - **Reservation Expiry Job** — `ReservationExpiryJob` runs on a configurable interval (default 60 s) and deletes all rows where `expires_at <= NOW()`, restoring their quantity to availability automatically
 - **Shortage Rollup** — `GET /rollup/sku-shortages` returns a paged, shortage-descending list of SKUs where open unfulfilled demand exceeds available stock; open demand accounts for active reservations (a line covered by a reservation does not count as unmet demand); pure Dapper read with a single CTE shared between the COUNT and the paged SELECT
 - **Allocation Event Ledger** — every unit movement writes an immutable `AllocationEvent` row inside the same transaction: `AllocationCommitted` (allocate), `AllocationReleased` (cancel), `ReservationCreated` (reserve), `ReservationReleased` (explicit release), `ReservationExpired` (background job via CTE); FKs to `orders`, `order_lines`, and `skus` all use `RESTRICT` so history survives order lifecycle changes; `GET /orders/{id}/events` returns the full chronological event list
+- **Transactional Outbox** — every write that produces a domain event appends an `OutboxMessage` row (event type + JSON payload) inside the same EF Core `SaveChangesAsync` call as the business write, guaranteeing the two are atomic; `OutboxRelayJob` (`BackgroundService`) polls the table on a configurable interval, delivers each message via `IEventPublisher`, and marks it `processed_at`; failures are recorded in `error` (leaving `processed_at` null) so the row stays eligible for the next relay pass; `OutboxLagHealthCheck` surfaces degraded status when the oldest unprocessed message is older than two minutes; current publisher implementation is `LoggingEventPublisher` — drop-in replacement for any real transport (Kafka, SNS, etc.)
+- **JWT Authentication** — `POST /api/v1/auth/token` issues a signed JWT for a requested role (development-use endpoint; in production, tokens come from your identity provider); JWT Bearer validation is wired in `Program.cs`; all controllers carry `[Authorize]` at the class level; unauthenticated requests return a standard-envelope `401`; forbidden role combinations return `403`
+- **Role-Based Access Control (RBAC)** — four roles enforced via `[Authorize(Roles = "...")]` at the action level: `warehouse-ops` (create SKU, adjust inventory), `sales-ops` (create order, cancel order), `allocation-manager` (allocate, reserve, release reservation, run global allocation), `read-only` (all GET endpoints — no specific role required beyond authentication); `POST /api/v1/auth/token` is `[AllowAnonymous]`
 - **Standard Envelope** — all responses use `{ success, statusCode, data, error }`; validation errors use the same shape; `[ApiController]` model-validation is overridden to produce the standard envelope instead of `ValidationProblemDetails`
 - **Structured Logging** — every write operation logs its outcome via `ILogger<T>` after the transaction commits (order created/cancelled/allocated, SKU created/adjusted, reservation reserved/released/expired); Serilog enriches every entry with `MachineName`, `ThreadId`, and `CorrelationId`
 - **Correlation ID** — `CorrelationIdMiddleware` accepts an inbound `X-Correlation-ID` header (or generates a 12-char random ID); echoes it on the response; pushes it into Serilog's `LogContext` so every log entry within the request carries it automatically
@@ -79,13 +82,20 @@ Every time units move — committed, released, or soft-held — an `AllocationEv
 
 ```
 HTTP request
-  → CorrelationIdMiddleware   (assigns / echoes X-Correlation-ID; pushes CorrelationId into Serilog LogContext)
+  → CorrelationIdMiddleware    (assigns / echoes X-Correlation-ID; pushes CorrelationId into Serilog LogContext)
   → ExceptionHandlerMiddleware (maps domain exceptions to standard envelope; logs warnings/errors with request path)
-  → Serilog request logging   (one structured log line per request: method, path, status, elapsed, correlation ID)
+  → Serilog request logging    (one structured log line per request: method, path, status, elapsed, correlation ID)
+  → UseAuthentication          (JWT Bearer validation; 401 on missing/invalid token)
+  → UseAuthorization           (role check; 403 on insufficient role)
   → Controllers
-  → Services                  (all writes log outcome via ILogger<T> after commit)
+  → Services                   (all writes log outcome via ILogger<T> after commit;
+                                 domain-event writes append OutboxMessage inside same SaveChangesAsync)
   → EF Core / Dapper
   → PostgreSQL
+
+Background workers
+  → ReservationExpiryJob  (expires stale reservations; inserts reservation_expired events via CTE)
+  → OutboxRelayJob        (polls outbox_messages; delivers via IEventPublisher; marks processed_at or error)
 ```
 
 Services are the only layer that touches the database. Controllers translate HTTP concerns (query params, status codes, response envelope) and delegate all business logic to the service layer. EF Core handles writes, aggregate loads, and raw-SQL locking queries; Dapper is used for multi-result read queries (order details with lines, paginated lists) where the result shape doesn't map cleanly to aggregate roots.
@@ -98,8 +108,9 @@ Services are the only layer that touches the database. Controllers translate HTT
 | Database | PostgreSQL 15+ with EF Core 8 (code-first migrations) |
 | Micro-ORM | Dapper 2.1 |
 | Logging | Serilog — structured logs to Console + Seq; enriched with `MachineName`, `ThreadId`, `CorrelationId` |
-| Background worker | `BackgroundService` (`ReservationExpiryJob`) |
-| Docs | Swagger / OpenAPI (Swashbuckle) with XML doc comments |
+| Background workers | `BackgroundService` (`ReservationExpiryJob`, `OutboxRelayJob`) |
+| Auth | JWT Bearer (`Microsoft.AspNetCore.Authentication.JwtBearer`); HMAC-SHA256 signed tokens |
+| Docs | Swagger / OpenAPI (Swashbuckle) with XML doc comments and JWT Bearer security definition |
 | Testing | xUnit + `WebApplicationFactory<Program>` — real Postgres database |
 
 ---
@@ -109,20 +120,22 @@ Services are the only layer that touches the database. Controllers translate HTT
 ```
 MaterialAllocationApi/
 ├── Program.cs                              # Service registration, middleware, migration on startup, SKU seed
-├── appsettings.json                        # Connection strings (app + migrator roles), Serilog, ReservationExpiry interval
+├── appsettings.json                        # Connection strings, Serilog, ReservationExpiry, OutboxRelay, Authentication
 ├── Controllers/
-│   ├── SkusController.cs                   # Create, get, list, adjust, availability
-│   ├── OrdersController.cs                 # Create, get, list, cancel, allocate, reserve
-│   ├── AllocationController.cs             # POST /allocations/run — global priority run
-│   ├── ReservationsController.cs           # Release
-│   └── RollupController.cs                 # GET sku-shortages
+│   ├── SkusController.cs                   # [warehouse-ops] create, adjust; any-auth get, list, availability
+│   ├── OrdersController.cs                 # [sales-ops] create, cancel; [allocation-manager] allocate, reserve; any-auth get, list, events
+│   ├── AllocationController.cs             # [allocation-manager] POST /allocations/run — global priority run
+│   ├── ReservationsController.cs           # [allocation-manager] release
+│   ├── RollupController.cs                 # Any-auth GET sku-shortages
+│   └── AuthController.cs                   # [AllowAnonymous] POST /api/v1/auth/token — issues JWT for a role
 ├── Domain/Entities/
 │   ├── Sku.cs                              # AllocateUnits(), ReleaseUnits(); version concurrency token
 │   ├── InventoryAdjustment.cs
 │   ├── Order.cs                            # Cancel(), RecomputeStatus() from line quantities
 │   ├── OrderLine.cs                        # Allocate(), ReleasedAllocation()
 │   ├── Reservation.cs
-│   └── AllocationEvent.cs                  # Immutable ledger row — EventType, OrderId, OrderLineId, SkuId, Quantity, OccurredAt
+│   ├── AllocationEvent.cs                  # Immutable ledger row — EventType, OrderId, OrderLineId, SkuId, Quantity, OccurredAt
+│   └── OutboxMessage.cs                    # processing / complete state; MarkProcessed(), MarkFailed(error)
 ├── Domain/Enums/
 │   ├── OrderPriority.cs
 │   ├── OrderStatus.cs
@@ -134,28 +147,40 @@ MaterialAllocationApi/
 │   ├── OrderRecords.cs                     # CreateOrderRequest / OrderResponse / OrderSummaryResponse
 │   ├── AllocationRecords.cs                # AllocationResponse / AllocationLineResult / AvailabilityResponse / AllocationRunResponse / AllocationRunResult / AllocationEventResponse
 │   ├── ReservationRecords.cs               # ReserveRequest / ReservationResponse / ReservationLineResult
-│   └── RollupRecords.cs                    # SkuShortageResponse
+│   ├── RollupRecords.cs                    # SkuShortageResponse
+│   └── AuthRecords.cs                      # TokenRequest / TokenResponse
 ├── Services/
 │   ├── Interfaces/
 │   │   ├── ISkuService.cs
 │   │   ├── IOrderService.cs
 │   │   ├── IAllocationService.cs
 │   │   ├── IReservationService.cs
-│   │   └── IRollupService.cs
+│   │   ├── IRollupService.cs
+│   │   ├── IEventPublisher.cs              # PublishAsync(OutboxMessage) — implemented by LoggingEventPublisher
+│   │   └── ITokenService.cs                # IssueToken(role) — implemented by JwtTokenService
 │   ├── SkuService.cs                       # Create, GetById, List, AdjustAsync (optimistic concurrency)
-│   ├── OrderService.cs                     # Create, GetById, List, CancelAsync (TX + FOR UPDATE); emits AllocationReleased events
-│   ├── AllocationService.cs                # AllocateAsync (TX + FOR UPDATE), GetAvailabilityAsync, RunPriorityAllocationAsync, GetEventsAsync; emits AllocationCommitted events
-│   ├── ReservationService.cs               # ReserveAsync (TX + FOR UPDATE), ReleaseAsync, ExpireAsync (CTE); emits Reservation* events
+│   ├── OrderService.cs                     # Create, GetById, List, CancelAsync (TX + FOR UPDATE); emits AllocationReleased events + outbox
+│   ├── AllocationService.cs                # AllocateAsync (TX + FOR UPDATE), GetAvailabilityAsync, RunPriorityAllocationAsync, GetEventsAsync; emits AllocationCommitted events + outbox
+│   ├── ReservationService.cs               # ReserveAsync (TX + FOR UPDATE), ReleaseAsync, ExpireAsync (CTE); emits Reservation* events + outbox
 │   ├── ReservationExpiryJob.cs             # BackgroundService — CTE: DELETE + INSERT allocation_events in one query
-│   └── RollupService.cs                    # GetSkuShortageAsync — Dapper CTE, no writes
+│   ├── RollupService.cs                    # GetSkuShortageAsync — Dapper CTE, no writes
+│   ├── EventPublisher.cs                   # LoggingEventPublisher: logs event type + payload; swap for Kafka/SNS in production
+│   ├── OutboxRelayJob.cs                   # BackgroundService — polls outbox_messages; delivers via IEventPublisher; marks processed_at or error
+│   └── JwtTokenService.cs                  # IssueToken — HMAC-SHA256 signed JWT with role claim; expiry from AuthSettings
 ├── Data/
-│   ├── AllocationDbContext.cs              # EF Core context — entity configs, indexes, CHECK constraints
+│   ├── AllocationDbContext.cs              # EF Core context — entity configs, indexes, CHECK constraints; OutboxMessages DbSet
 │   ├── IDbConnectionFactory.cs / NpgsqlConnectionFactory.cs
 │   ├── TransactionHelper.cs                # RollbackAsync — safe rollback that swallows secondary exceptions
 │   └── Seed/SkuSeeder.cs                   # Seeds 5 memory/NAND SKUs on first startup (idempotent)
 ├── Common/
 │   ├── ApiResponse.cs                      # Generic response envelope + ApiError
 │   ├── PagedResult.cs
+│   ├── Helper.cs                           # Helpers.Serialize(obj) — camelCase JSON serializer used by outbox payload builders
+│   ├── Config/
+│   │   ├── AuthSettings.cs                 # JwtSecret, Issuer, Audience, TokenExpiryMinutes
+│   │   └── OutboxRelaySettings.cs          # IntervalSeconds, BatchSize
+│   ├── Health/
+│   │   └── OutboxLagHealthCheck.cs         # Degraded when oldest unprocessed outbox message > 2 minutes old
 │   └── Exceptions/
 │       ├── NotFoundException.cs
 │       ├── ConflictException.cs
@@ -163,18 +188,26 @@ MaterialAllocationApi/
 ├── Middleware/
 │   ├── CorrelationIdMiddleware.cs          # Assigns/echoes X-Correlation-ID; pushes into Serilog LogContext
 │   └── ExceptionHandlerMiddleware.cs       # Maps domain exceptions to standard envelope + status codes; logs with request path
-└── Migrations/                             # EF Core migration history
+└── Migrations/                             # EF Core migration history (includes AddOutboxMessages)
 
 MaterialAllocationApi.Tests/
 ├── Fixtures/
-│   └── ApiFixture.cs                       # WebApplicationFactory<Program>; MigrateAsync on init; ResetDatabaseAsync between tests
+│   └── ApiFixture.cs                       # WebApplicationFactory<Program>; MigrateAsync on init; ResetDatabaseAsync between tests;
+│                                           # removes OutboxRelayJob from test host; replaces JWT Bearer with TestAuthHandler
 ├── Helpers/
-│   └── AllocationTestBase.cs               # HTTP helpers (CreateSkuAsync, CreateOrderAsync, AllocateAsync, …); DB assertion helpers
+│   └── AllocationTestBase.cs               # HTTP helpers (CreateSkuAsync, CreateOrderAsync, AllocateAsync, …); DB assertion helpers;
+│                                           # AuthorizeAs(roles) / AuthorizeAsAll() role-header helpers
 ├── Allocation/
 │   ├── AllocationFlowTests.cs              # Partial allocation, sequential top-up, over-demand, priority run (critical before standard)
 │   ├── ConcurrentAllocationTests.cs        # Two parallel allocates on the same SKU — exactly one wins
 │   ├── CancelTests.cs                      # Cancel + inventory restoration; cancel with no allocations
-│   └── ReservationTests.cs                 # Reserve, block, own-order exception, TTL refresh, release, expiry, cancel-deletes
+│   ├── ReservationTests.cs                 # Reserve, block, own-order exception, TTL refresh, release, expiry, cancel-deletes
+│   └── AllocationAuditTests.cs             # 7 event-ledger tests: committed, released, reservation lifecycle, zero-stock guard, partial-stock guard
+├── Auth/
+│   ├── TestAuthHandler.cs                  # Fake auth scheme: reads X-Test-Role header; returns NoResult() (→ 401) when absent
+│   └── RbacTests.cs                        # 19 RBAC tests: anonymous token endpoint, 401 on no auth, 403 on wrong role, 2xx on correct role
+├── Outbox/
+│   └── OutboxPatternTests.cs               # 8 outbox tests: written on allocation/cancel/reserve/release/expiry, relay marks processed, relay records error, atomicity
 └── Rollup/
     └── RollupTests.cs                      # 6 shortage tests: empty, fully allocated, open, partial, reservations, ordering
 ```
@@ -245,6 +278,16 @@ Edit `appsettings.json`:
   },
   "ReservationExpiry": {
     "IntervalSeconds": 60
+  },
+  "OutboxRelay": {
+    "IntervalSeconds": 5,
+    "BatchSize": 50
+  },
+  "Authentication": {
+    "JwtSecret": "change-this-to-a-random-256-bit-secret-in-production",
+    "Issuer": "material-allocation-api",
+    "Audience": "material-allocation-clients",
+    "TokenExpiryMinutes": 60
   }
 }
 ```
@@ -527,6 +570,39 @@ Results are ordered by `shortage` descending (worst shortages first), then `skuC
 
 ---
 
+### Auth
+
+| Method | Path | Description |
+|---|---|---|
+| POST | `/api/v1/auth/token` | Issue a signed JWT for the given role (development use only) |
+
+**POST `/api/v1/auth/token`** is `[AllowAnonymous]` — no `Authorization` header is required.
+
+**Request body:**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `role` | string | yes | One of `warehouse-ops`, `sales-ops`, `allocation-manager`, `read-only` |
+
+**Response:**
+
+| Field | Type | Description |
+|---|---|---|
+| `token` | string | Signed JWT — pass as `Authorization: Bearer <token>` on subsequent requests |
+
+**Status codes:**
+
+| Code | Meaning |
+|---|---|
+| 200 | Token issued |
+| 422 | Unknown role |
+
+The token is signed with HMAC-SHA256 using the `Authentication:JwtSecret` from configuration. Swagger UI includes a "Authorize" button — paste the token there to authenticate all subsequent requests.
+
+In production, replace this endpoint with tokens issued by your identity provider. The role claim in the JWT is what the `[Authorize(Roles = "...")]` attributes check.
+
+---
+
 ## Data Models
 
 ### Sku
@@ -601,6 +677,19 @@ All three FKs use `RESTRICT` — rows cannot be deleted if they have event histo
 
 Indexes: `orderId` (primary query: all events for one order), `skuId` (cross-order audit queries by SKU), `occurredAt` (chronological range queries)
 
+### OutboxMessage
+
+```
+id           Guid              PK
+eventType    string            e.g. order.allocated, order.cancelled, reservation.created, reservation.released, reservation.expired
+payload      jsonb             event-specific JSON (camelCase); e.g. { orderId, status, isFullyAllocated } for order.allocated
+createdAt    DateTimeOffset    written inside the originating write transaction
+processedAt  DateTimeOffset?   set by OutboxRelayJob on successful delivery; null while pending or after failure
+error        string?           last relay error message; set on publisher failure; processedAt stays null (retry-eligible)
+```
+
+`OutboxRelayJob` polls `WHERE processed_at IS NULL ORDER BY created_at` in batches of `OutboxRelaySettings.BatchSize` (default 50). The relay writes both `processed_at` and `error` updates in a single `SaveChangesAsync` call after processing the batch.
+
 ---
 
 ## Pagination
@@ -655,3 +744,5 @@ On first startup, 5 representative memory and NAND SKUs are seeded automatically
 | 9 | Observability — Serilog structured logging (Console + Seq sink) with `MachineName`/`ThreadId`/`CorrelationId` enrichment; `ILogger<T>` in all services with post-commit log entries; `CorrelationIdMiddleware`; health checks (`/health`, `/health/live`, `/health/ready`) with Npgsql probe; Swagger XML doc comments and full API description | Done |
 | 10 | Priority allocation run — `POST /allocations/run` processes all open orders globally in `critical` → `high` → `standard` order (FIFO within tier); `AllocationController` + `RunPriorityAllocationAsync`; sequential execution preserves Phase 4 locking invariants; 1 integration test verifying critical order receives stock before standard | Done |
 | 11 | Allocation event ledger — `allocation_events` table with `AllocationEventType` enum (`AllocationCommitted`, `AllocationReleased`, `ReservationCreated`, `ReservationReleased`, `ReservationExpired`); events written inside existing write transactions by `AllocationService`, `OrderService`, and `ReservationService`; expiry background job uses a single CTE to DELETE reservations and INSERT expiry events atomically; all FKs use RESTRICT (immutable history); `GET /orders/{id}/events` endpoint returns full chronological event list | Done |
+| 12 | Transactional outbox — `outbox_messages` table (`event_type`, `payload jsonb`, `processed_at`, `error`); `OutboxMessage` entity with `MarkProcessed()` / `MarkFailed(error)`; outbox row written inside the same `SaveChangesAsync` as every domain write (allocation, cancel, reserve, release, expiry); `OutboxRelayJob` `BackgroundService` polls unprocessed rows in batches, publishes via `IEventPublisher`, marks `processed_at` on success or records `error` on failure; `LoggingEventPublisher` logs event + payload (drop-in for Kafka/SNS); `OutboxLagHealthCheck` reports degraded when oldest unprocessed message > 2 min; 8 integration tests covering write, relay, failure recording, and atomicity | Done |
+| 13 | JWT auth + RBAC — `POST /api/v1/auth/token` (`[AllowAnonymous]`) issues HMAC-SHA256 signed JWTs for a requested role; JWT Bearer validation in `Program.cs`; `[Authorize]` on all controllers; four role-restricted scopes: `warehouse-ops` (SKU writes), `sales-ops` (order create/cancel), `allocation-manager` (allocate, reserve, release, run), read-only GET access requires only authentication; `TestAuthHandler` in test project replaces JWT validation with `X-Test-Role` header; `AuthorizeAs()` / `AuthorizeAsAll()` helpers on `AllocationTestBase`; 19 RBAC integration tests covering 401, 403, and 2xx for all roles | Done |

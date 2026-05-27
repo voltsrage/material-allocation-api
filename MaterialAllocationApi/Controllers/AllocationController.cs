@@ -1,6 +1,8 @@
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 
 /// <summary>Global priority-aware allocation run across all open orders.</summary>
+[Authorize]
 [ApiController]
 [Route("api/v1/allocations")]
 public class AllocationController : ControllerBase
@@ -17,6 +19,7 @@ public class AllocationController : ControllerBase
     /// Each order is allocated in its own transaction. Returns a summary of outcomes.
     /// </summary>
     /// <response code="200">Run complete. Check per-order results for individual outcomes.</response>
+    [Authorize(Roles = "allocation-manager")]
     [HttpPost("run")]
     [ProducesResponseType(typeof(ApiResponse<AllocationRunResponse>), 200)]
     public async Task<ActionResult<ApiResponse<AllocationRunResponse>>> RunAllocation(CancellationToken ct)

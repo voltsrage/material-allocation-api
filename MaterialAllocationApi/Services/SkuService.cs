@@ -38,6 +38,15 @@ public class SkuService : ISkuService
         // The adjustment row and the updated on_hand land atomically.
         _db.InventoryAdjustments.Add(adjustment);
 
+        _db.OutboxMessages.Add(new OutboxMessage("sku.adjusted", Helpers.Serialize(new
+        {
+            skuId = id,
+            skuCode = sku.SkuCode,
+            delta = request.Delta,
+            reason = request.Reason,
+            newOnHand = sku.OnHand
+        })));
+
         try
         {
             await _db.SaveChangesAsync(ct);

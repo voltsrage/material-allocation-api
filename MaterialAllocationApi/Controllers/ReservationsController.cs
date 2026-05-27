@@ -1,6 +1,8 @@
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 
 /// <summary>Explicit reservation release before TTL expiry.</summary>
+[Authorize]
 [ApiController]
 [Route("api/v1/reservations")]
 public class ReservationsController: ControllerBase
@@ -15,6 +17,7 @@ public class ReservationsController: ControllerBase
     /// <summary>Explicitly release a reservation before it expires.</summary>
     /// <response code="204">Reservation released.</response>
     /// <response code="404">No reservation with the given ID exists.</response>
+    [Authorize(Roles = "allocation-manager")]
     [HttpPost("{id:guid}/release")]
     [ProducesResponseType(StatusCodes.Status204NoContent)]
     [ProducesResponseType(typeof(ApiResponse<object>), StatusCodes.Status404NotFound)]

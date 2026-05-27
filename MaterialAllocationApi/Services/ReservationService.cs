@@ -28,17 +28,40 @@ public class ReservationService : IReservationService
                 DELETE FROM reservations
                 WHERE expires_at <= @now
                 RETURNING id, order_line_id, quantity
+            ),
+            joined AS (
+                SELECT
+                    e.id AS reservation_id,
+                    e.order_line_id,
+                    e.quantity,
+                    ol.order_id,
+                    ol.sku_id
+                FROM expired e
+                JOIN order_lines ol ON ol.id = e.order_line_id
+            ),
+            audit AS (
+                INSERT INTO allocation_events (event_type, order_id, order_line_id, sku_id, quantity, occurred_at)
+                SELECT
+                    'reservation_expired',
+                    order_id,
+                    order_line_id,
+                    sku_id,
+                    quantity,
+                    NOW()
+                FROM joined
             )
-            INSERT INTO allocation_events (event_type, order_id, order_line_id, sku_id, quantity, occurred_at)
+            INSERT INTO outbox_messages(event_type, payload, created_at)
             SELECT
-                'reservation_expired',
-                ol.order_id,
-                e.order_line_id,
-                ol.sku_id,
-                e.quantity,
+                'reservation.expired',
+                jsonb_build_object(
+                    'reservationId', reservation_id::text,
+                    'orderLineId', order_line_id::text,
+                    'orderId', order_id::text,
+                    'skuId', sku_id::text,
+                    'quantity', quantity
+                ),
                 NOW()
-            FROM expired e
-            JOIN order_lines ol ON ol.id = e.order_line_id
+            FROM joined
             ",
             new {now = DateTimeOffset.UtcNow}
         );
@@ -70,6 +93,15 @@ public class ReservationService : IReservationService
                 reservation.OrderLine.SkuId,
                 reservation.Quantity
             ));
+
+            _db.OutboxMessages.Add(new OutboxMessage("reservation.released", Helpers.Serialize(new
+            {
+                reservationId = reservation.Id,
+                orderId = reservation.OrderLine.OrderId,
+                orderLineId = reservation.OrderLineId,
+                skuId = reservation.OrderLine.SkuId,
+                quantity = reservation.Quantity
+            })));
 
             await _db.SaveChangesAsync(ct);
             await tx.CommitAsync(ct);
@@ -179,12 +211,25 @@ public class ReservationService : IReservationService
                 _db.Reservations.Add(new Reservation(line.Id, (int)canReserve, expiresAt));
 
                 _db.AllocationEvents.Add(new AllocationEvent(
-                        AllocationEventType.AllocationCommitted, orderId, line.Id, line.SkuId, (int)canReserve
+                        AllocationEventType.ReservationCreated, orderId, line.Id, line.SkuId, (int)canReserve
                     ));
 
                 results.Add(new ReservationLineResult(
                     line.Id, line.SkuId, skuCode, (int)canReserve, expiresAt.UtcDateTime));
             }
+
+            _db.OutboxMessages.Add(new OutboxMessage("reservation.created", Helpers.Serialize(new
+            {
+                orderId = order.Id,
+                referenceCode = order.ReferenceCode,
+                expiresAt = expiresAt.UtcDateTime,
+                lines = results.Select(r => new
+                {
+                    orderLineId = r.OrderLineId,
+                    skuId = r.SkuId,
+                    reservedQty = r.QuantityReserved
+                })
+            })));
 
             await _db.SaveChangesAsync(ct);
             await tx.CommitAsync(ct);

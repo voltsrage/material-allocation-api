@@ -11,6 +11,7 @@ public class AllocationDbContext : DbContext
     public DbSet<OrderLine> OrderLines => Set<OrderLine>();
     public DbSet<Reservation> Reservations => Set<Reservation>();
     public DbSet<AllocationEvent> AllocationEvents => Set<AllocationEvent>();
+    public DbSet<OutboxMessage> OutboxMessages => Set<OutboxMessage>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -159,6 +160,25 @@ public class AllocationDbContext : DbContext
             b.HasIndex(x => x.SkuId).HasDatabaseName("idx_allocation_events_sku_id");
             // Chronological reporting queries
             b.HasIndex(x => x.OccurredAt).HasDatabaseName("idx_allocation_events_occurred_at");
+        });
+
+        modelBuilder.Entity<OutboxMessage>(b =>
+        {
+            b.ToTable("outbox_messages");
+            b.HasKey(x => x.Id);
+            b.Property(x => x.Id).HasColumnName("id").HasDefaultValueSql("gen_random_uuid()");
+            b.Property(x => x.EventType).HasColumnName("event_type").HasMaxLength(128).IsRequired();
+            b.Property(x => x.Payload).HasColumnName("payload").HasColumnType("jsonb").IsRequired();
+            b.Property(x => x.CreatedAt).HasColumnName("created_at").IsRequired();
+            b.Property(x => x.ProcessedAt).HasColumnName("processed_at");
+            b.Property(x => x.Error).HasColumnName("error");
+
+            // The relay query fetches only unprocessed rows, ordered by creation time.
+            // A partial index on WHERE processed_at IS NULL keeps this query fast as
+            // the processed row count grows — processed rows are excluded from the index entirely.
+            b.HasIndex(x => x.CreatedAt)
+                .HasFilter("processed_at IS NULL")
+                .HasDatabaseName("idx_outbox_messages_unprocessed");
         });
     }
 }

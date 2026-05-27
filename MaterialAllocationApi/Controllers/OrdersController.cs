@@ -1,6 +1,8 @@
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 
 /// <summary>Order lifecycle: create, list, get, allocate, reserve, and cancel.</summary>
+[Authorize]
 [ApiController]
 [Route("api/v1/orders")]
 public class OrdersController : ControllerBase
@@ -20,6 +22,7 @@ public class OrdersController : ControllerBase
     /// <summary>Create an order with one or more lines referencing existing SKUs.</summary>
     /// <response code="201">Order created.</response>
     /// <response code="422">Reference code already exists, unknown SKU IDs, duplicate SKU in lines, invalid priority, or requested_qty ≤ 0.</response>
+    [Authorize(Roles = "sales-ops")]
     [HttpPost]
     [ProducesResponseType(typeof(ApiResponse<OrderResponse>), StatusCodes.Status201Created)]
     [ProducesResponseType(typeof(ApiResponse<object>), StatusCodes.Status422UnprocessableEntity)]
@@ -67,6 +70,7 @@ public class OrdersController : ControllerBase
     /// <response code="200">Order cancelled.</response>
     /// <response code="404">No order with the given ID exists.</response>
     /// <response code="409">Order is already cancelled.</response>
+    [Authorize(Roles = "sales-ops")]
     [HttpPost("{id:guid}/cancel")]
     [ProducesResponseType(typeof(ApiResponse<OrderResponse>), StatusCodes.Status200OK)]
     [ProducesResponseType(typeof(ApiResponse<object>), StatusCodes.Status404NotFound)]
@@ -87,6 +91,7 @@ public class OrdersController : ControllerBase
     /// <response code="200">Allocation applied; response shows partial or full result.</response>
     /// <response code="404">No order with the given ID exists.</response>
     /// <response code="409">Order is cancelled or already fully allocated.</response>
+    [Authorize(Roles = "allocation-manager")]
     [HttpPost("{id:guid}/allocate")]
     [ProducesResponseType(typeof(ApiResponse<AllocationResponse>), StatusCodes.Status200OK)]
     [ProducesResponseType(typeof(ApiResponse<object>), StatusCodes.Status404NotFound)]
@@ -105,6 +110,7 @@ public class OrdersController : ControllerBase
     /// <response code="200">Reservation created. Lines array may be empty if no stock is available to reserve.</response>
     /// <response code="404">Order not found.</response>
     /// <response code="409">Order is cancelled or fully allocated.</response>
+    [Authorize(Roles = "allocation-manager")]
     [HttpPost("{id:guid}/reserve")]
     [ProducesResponseType(typeof(ApiResponse<ReservationResponse>), StatusCodes.Status200OK)]
     [ProducesResponseType(typeof(ApiResponse<object>), StatusCodes.Status409Conflict)]

@@ -1,3 +1,4 @@
+using System.Security.Claims;
 using Serilog.Context;
 
 namespace MaterialAllocationApi.Common.Middleware;
@@ -19,6 +20,8 @@ public class CorrelationIdMiddleware
 
         // Push into Serilog's LogContext so every log entry within this request carries
         // the CorrelationId property without callers needing to pass it explicitly.
+        var role = context.User.FindFirst(ClaimTypes.Role)?.Value ?? "anonymous";
+        using (LogContext.PushProperty("CallerRole", role))
         using (LogContext.PushProperty("CorrelationId", correlationId))
         {
             await _next(context);

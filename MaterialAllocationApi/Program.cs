@@ -1,11 +1,14 @@
 using System.Reflection;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using MaterialAllocationApi.Common.Middleware;
+using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Diagnostics.HealthChecks;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Diagnostics.HealthChecks;
+using Microsoft.IdentityModel.Tokens;
 using Microsoft.OpenApi;
 using Serilog;
 
@@ -45,6 +48,68 @@ try
     builder.Services.AddScoped<IReservationService, ReservationService>();
     builder.Services.AddHostedService<ReservationExpiryJob>();
     builder.Services.AddScoped<IRollupService, RollupService>();
+    builder.Services.AddScoped<ITokenService, JwtTokenService>();
+
+    builder.Services.Configure<OutboxRelaySettings>(
+        builder.Configuration.GetSection("OutboxRelay")
+    );
+    builder.Services.AddScoped<IEventPublisher, LoggingEventPublisher>();
+    builder.Services.AddHostedService<OutboxRelayJob>();
+
+    var authSettings = builder.Configuration
+        .GetSection("Authentication")
+        .Get<AuthSettings>()!;
+
+    builder.Services.Configure<AuthSettings>(
+        builder.Configuration.GetSection("Authentication")
+    );
+
+    var signingKey = new SymmetricSecurityKey(
+        Encoding.UTF8.GetBytes(authSettings.JwtSecret)
+    );
+
+    builder.Services
+        .AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+        .AddJwtBearer(options =>
+        {
+            options.TokenValidationParameters = new
+            TokenValidationParameters
+            {
+                ValidateIssuer = true,
+                ValidateAudience = true,
+                ValidateLifetime = true,
+                ValidateIssuerSigningKey = true,
+                ValidIssuer = authSettings.Issuer,
+                ValidAudience= authSettings.Audience,
+                IssuerSigningKey = signingKey,
+                ClockSkew = TimeSpan.Zero
+            };
+
+            // Return JSON in the standard ApiResponse envelope instead of the
+            // default 401/403 plain-text or redirect responses
+
+            options.Events = new JwtBearerEvents
+            {
+                OnChallenge = async ctx =>
+                {
+                    ctx.HandleResponse();
+                    ctx.Response.StatusCode = 401;
+                    ctx.Response.ContentType = "application/json";
+                    await ctx.Response.WriteAsJsonAsync(
+                        ApiResponse<object>.Fail(401, "Authentication required.", "UNAUTHORIZED")
+                    );
+                },
+                OnForbidden = async ctx =>
+                {
+                    ctx.Response.StatusCode  = 403;
+                    ctx.Response.ContentType = "application/json";
+                    await ctx.Response.WriteAsJsonAsync(
+                        ApiResponse<object>.Fail(403, "Insufficient permissions.", "FORBIDDEN"));
+                }
+            };
+        });
+
+    builder.Services.AddAuthorization();
 
     builder.Services.AddControllers()
         .AddJsonOptions(o =>
@@ -74,6 +139,24 @@ try
         var xmlFile = $"{Assembly.GetExecutingAssembly().GetName().Name}.xml";
         var xmlPath = Path.Combine(AppContext.BaseDirectory, xmlFile);
         options.IncludeXmlComments(xmlPath);
+
+        options.AddSecurityDefinition("Bearer", new OpenApiSecurityScheme
+        {
+            Name         = "Authorization",
+            Type         = SecuritySchemeType.Http,
+            Scheme       = "bearer",
+            BearerFormat = "JWT",
+            In           = ParameterLocation.Header,
+            Description  = "Paste a JWT from POST /api/v1/auth/token. Example: `Bearer eyJ...`"
+        });
+
+        options.AddSecurityRequirement(_ => new OpenApiSecurityRequirement
+        {
+            {
+                new OpenApiSecuritySchemeReference("Bearer"),
+                new List<string>()
+            }
+        });
 
         // Group operations under their controller tags.
         options.TagActionsBy(api => [api.GroupName ?? api.ActionDescriptor.RouteValues["controller"]!]); 
@@ -144,6 +227,9 @@ try
         if(!app.Environment.IsEnvironment("Test"))
             await SkuSeeder.SeedAsync(db);
     }
+
+    app.UseAuthentication();
+    app.UseAuthorization();
 
     app.MapControllers();
     app.MapHealthChecks("/health", new HealthCheckOptions

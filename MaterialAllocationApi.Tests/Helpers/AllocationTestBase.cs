@@ -25,7 +25,10 @@ public abstract class AllocationTestBase : IAsyncLifetime
     }
 
     // Runs before each test — clean slate every time.
-    public Task InitializeAsync() => Fixture.ResetDatabaseAsync();
+    public async Task InitializeAsync(){
+        AuthorizeAsAll();
+        await Fixture.ResetDatabaseAsync();
+    }
     public Task DisposeAsync()    => Task.CompletedTask;
 
     // ── HTTP helpers ──────────────────────────────────────────────────────────
@@ -141,4 +144,17 @@ public abstract class AllocationTestBase : IAsyncLifetime
             """,
             new { orderId, skuId });
     }
+
+    // Sets the default role header for all subsequent requests on this client.
+    protected void AuthorizeAs(params string[] roles)
+    {
+        Client.DefaultRequestHeaders.Remove(TestAuthHandler.RoleHeader);
+        Client.DefaultRequestHeaders.Add(
+            TestAuthHandler.RoleHeader, string.Join(",", roles)
+        );
+    }
+
+    // Grants all roles — used by test setup methods that mix SKU, order, and allocation calls.
+    protected void AuthorizeAsAll() =>
+        AuthorizeAs("warehouse-ops", "sales-ops", "allocation-manager", "read-only");
 }

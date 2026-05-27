@@ -55,6 +55,14 @@ public class OrderService : IOrderService
                     "DELETE FROM reservations WHERE order_line_id = ANY(@ids)",
                     new NpgsqlParameter("ids", allLineIds));
             }
+
+            _db.OutboxMessages.Add(new OutboxMessage("order.cancelled", Helpers.Serialize(new
+            {
+                orderId = order.Id,
+                referenceCode = order.ReferenceCode,
+                releasedLines = Array.Empty<object>()
+            })));
+
             await _db.SaveChangesAsync(ct);
             _logger.LogInformation("Order {OrderId} cancelled. AllocatedLinesReleased=0.", id);
             return await GetByIdAsync(order.Id, ct);
@@ -101,7 +109,7 @@ public class OrderService : IOrderService
                 line.ReleasedAllocation();
 
                 _db.AllocationEvents.Add(new AllocationEvent(
-                        AllocationEventType.AllocationCommitted, id, line.Id, line.SkuId, releasedQty
+                        AllocationEventType.AllocationReleased, id, line.Id, line.SkuId, releasedQty
                     ));
             }
 
@@ -114,6 +122,17 @@ public class OrderService : IOrderService
                 );
             }
 
+            _db.OutboxMessages.Add(new OutboxMessage("order.cancelled", Helpers.Serialize(new
+            {
+                orderId = order.Id,
+                referenceCode = order.ReferenceCode,
+                releasedLines = allocatedLines.Select(l => new
+                {
+                    skuId = l.SkuId,
+                    releasedQty = l.AllocatedQty
+                })
+            })));
+            
             // 7. Order status is already set to Cancelled by the pre-flight Cancel() call;
             // SaveChangesAsync persists:
             //  - orders.status = 'cancelled' (via EF value converter)
@@ -182,6 +201,14 @@ public class OrderService : IOrderService
         }
 
         _db.Orders.Add(order);
+
+        _db.OutboxMessages.Add(new OutboxMessage("order.created", Helpers.Serialize(new
+        {
+            orderId = order.Id,
+            referenceCode = order.ReferenceCode,
+            priority = order.Priority.ToDbString(),
+            lineCount = order.Lines.Count
+        })));
 
         try
         {

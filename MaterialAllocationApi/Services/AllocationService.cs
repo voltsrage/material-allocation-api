@@ -127,6 +127,22 @@ public class AllocationService : IAllocationService
             // RecomputeStatus reads Lines - they are loaded (Include above) and updated in-memory
             order.RecomputeStatus();
 
+            _db.OutboxMessages.Add(new OutboxMessage("order.allocated", Helpers.Serialize(new
+            {
+                orderId = order.Id,
+                referenceCode = order.ReferenceCode,
+                priority = order.Priority.ToDbString(),
+                status = order.Status.ToDbString(),
+                isFullyAllocated = order.Status == OrderStatus.FullyAllocated,
+                lines = results.Select(r => new
+                {
+                    skuId = r.SkuId,
+                    skuCode = r.SkuCode,
+                    allocatedQty = r.AllocatedQty,
+                    remainingQty = r.RemainingQty
+                })
+            })));
+
             // 7. One SaveChangesAsync = one implicit transaction batch. Commits
             // - skus.on_hand decrements (one UPDATE per SKU)
             // - order_lines.allocated_qty increments (one UPDATE PER Line)

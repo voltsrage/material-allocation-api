@@ -1,6 +1,8 @@
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 
 /// <summary>SKU catalog and inventory adjustment operations.</summary>
+[Authorize]
 [ApiController]
 [Route("api/v1/skus")]
 public class SkusController : ControllerBase
@@ -17,6 +19,7 @@ public class SkusController : ControllerBase
     /// <summary>Create a new SKU with an initial on-hand quantity.</summary>
     /// <response code="201">SKU created.</response>
     /// <response code="422">SKU code missing, too long, negative initial quantity, or code already exists.</response>
+    [Authorize(Roles = "warehouse-ops")]
     [HttpPost]
     [ProducesResponseType(typeof(ApiResponse<SkuResponse>), StatusCodes.Status201Created)]
     [ProducesResponseType(typeof(ApiResponse<object>), StatusCodes.Status422UnprocessableEntity)]    
@@ -64,6 +67,7 @@ public class SkusController : ControllerBase
     /// <response code="404">No SKU with the given ID exists.</response>
     /// <response code="409">Concurrent modification detected — re-read and retry.</response>
     /// <response code="422">Delta would drive on_hand negative, or reason is missing.</response>
+    [Authorize(Roles = "warehouse-ops")]
     [HttpPost("{id:guid}/adjust")]
     [ProducesResponseType(typeof(ApiResponse<SkuResponse>), StatusCodes.Status200OK)]
     [ProducesResponseType(typeof(ApiResponse<object>), StatusCodes.Status404NotFound)]
