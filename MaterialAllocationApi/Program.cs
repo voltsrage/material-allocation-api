@@ -49,6 +49,7 @@ try
     builder.Services.AddHostedService<ReservationExpiryJob>();
     builder.Services.AddScoped<IRollupService, RollupService>();
     builder.Services.AddScoped<ITokenService, JwtTokenService>();
+    builder.Services.AddScoped<IAllocationRunService, AllocationRunService>();
 
     builder.Services.Configure<OutboxRelaySettings>(
         builder.Configuration.GetSection("OutboxRelay")
@@ -57,6 +58,8 @@ try
     builder.Services.AddHostedService<OutboxRelayJob>();
 
     builder.Services.AddHostedService<IdempotencyCleanupJob>();
+
+    builder.Services.AddHostedService<AllocationRunWorker>();
 
     var authSettings = builder.Configuration
         .GetSection("Authentication")
@@ -189,7 +192,9 @@ try
             connectionString: builder.Configuration.GetConnectionString("Postgres")!,
             name: "postgres",
             tags: ["db", "ready"]
-        );
+        )
+        .AddCheck<OutboxLagHealthCheck>("outbox-lag", tags: ["ready"])
+        .AddCheck<AllocationRunHealthCheck>("allocation-run", tags: ["ready"]);;
 
     var app = builder.Build();
 

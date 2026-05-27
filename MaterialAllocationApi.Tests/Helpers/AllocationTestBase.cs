@@ -1,8 +1,12 @@
 using System.Net;
 using System.Net.Http.Json;
+using System.Reflection;
 using System.Text.Json;
 using Dapper;
 using MaterialAllocationApi.Tests.Fixtures;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using Npgsql;
 
 namespace MaterialAllocationApi.Tests.Helpers;
@@ -157,4 +161,66 @@ public abstract class AllocationTestBase : IAsyncLifetime
     // Grants all roles — used by test setup methods that mix SKU, order, and allocation calls.
     protected void AuthorizeAsAll() =>
         AuthorizeAs("warehouse-ops", "sales-ops", "allocation-manager", "read-only");
+
+    /// <summary>
+    /// Creates a fresh <see cref="AllocationRunWorker"/> and invokes one processing cycle
+    /// synchronously via reflection. The background worker is stripped from the test host
+    /// (see <see cref="ApiFixture"/>) so tests control exactly when a run is processed.
+    /// </summary>
+    protected Task TriggerAllocationWorkerAsync() =>
+        TriggerAllocationWorkerAsync(Fixture.Services);
+
+    /// <summary>
+    /// Same as <see cref="TriggerAllocationWorkerAsync()"/> but resolves services from
+    /// <paramref name="services"/>. Use this when the test creates a custom
+    /// <see cref="Microsoft.AspNetCore.Mvc.Testing.WebApplicationFactory{TEntryPoint}"/>
+    /// (e.g. for fault injection) and needs the worker to use that factory's DI scope.
+    /// </summary>
+    protected async Task TriggerAllocationWorkerAsync(IServiceProvider services)
+    {
+        var scopeFactory = services.GetRequiredService<IServiceScopeFactory>();
+        var logger       = services.GetRequiredService<ILogger<AllocationRunWorker>>();
+        var config       = services.GetRequiredService<IConfiguration>();
+
+        var worker = new AllocationRunWorker(scopeFactory, logger, config);
+
+        using var scope = services.CreateScope();
+
+        var method = typeof(AllocationRunWorker).GetMethod(
+            "ProcessNextAsync",
+            BindingFlags.NonPublic | BindingFlags.Instance)
+            ?? throw new InvalidOperationException(
+                "ProcessNextAsync not found — was the method renamed?");
+
+        await (Task)method.Invoke(worker, [scope, CancellationToken.None])!;
+    }
+
+    protected async Task<Guid> SubmitAllocationRunAsync()
+    {
+        var response = await Client.PostAsync("/api/v1/allocations/run", null);
+        Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+
+        var envelope = await ReadAsync<AllocationRunAcceptedResponse>(response);
+        return envelope.RunId;
+    }
+
+    protected async Task<AllocationRunStatusResponse> PollRunUntilCompleteAsync(
+        Guid runId, int maxAttempts = 20, int delayMs = 250)
+    {
+        for (var i = 0; i < maxAttempts; i++)
+        {
+            var response = await Client.GetAsync($"/api/v1/allocations/runs/{runId}");
+            response.EnsureSuccessStatusCode();
+
+            var run = await ReadAsync<AllocationRunStatusResponse>(response);
+
+            if (run.Status is "completed" or "failed")
+                return run;
+
+            await Task.Delay(delayMs);
+        }
+
+        throw new TimeoutException(
+            $"Allocation run {runId} did not complete within {maxAttempts * delayMs}ms.");
+    }
 }

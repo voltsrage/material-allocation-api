@@ -13,6 +13,7 @@ public class AllocationDbContext : DbContext
     public DbSet<AllocationEvent> AllocationEvents => Set<AllocationEvent>();
     public DbSet<OutboxMessage> OutboxMessages => Set<OutboxMessage>();
     public DbSet<IdempotencyRecord> IdempotencyRecords => Set<IdempotencyRecord>();
+    public DbSet<AllocationRun> AllocationRuns => Set<AllocationRun>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -192,7 +193,7 @@ public class AllocationDbContext : DbContext
             b.Property(x => x.RequestMethod).HasColumnName("request_method").HasMaxLength(10).IsRequired();
             b.Property(x => x.Status).HasColumnName("status").HasMaxLength(32).IsRequired();
             b.Property(x => x.ResponseStatus).HasColumnName("response_status");
-            b.Property(x => x.ResponseBody).HasColumnName("response_body").HasColumnType("jsonb");
+            b.Property(x => x.ResponseBody).HasColumnName("response_body").HasColumnType("text");
             b.Property(x => x.CreatedAt).HasColumnName("created_at").IsRequired();
             b.Property(x => x.ExpiresAt).HasColumnName("expires_at").IsRequired();
 
@@ -204,6 +205,27 @@ public class AllocationDbContext : DbContext
             // Cleanup job scans by expires_at.
             b.HasIndex(x => x.ExpiresAt)
                 .HasDatabaseName("idx_idempotency_keys_expiry");
+        });
+
+        modelBuilder.Entity<AllocationRun>(b =>
+        {
+            b.ToTable("allocation_runs");
+            b.HasKey(x => x.Id);
+            b.Property(x => x.Id).HasColumnName("id").HasDefaultValueSql("gen_random_uuid()");
+            b.Property(x => x.Status).HasColumnName("status").HasMaxLength(32).IsRequired();
+            b.Property(x => x.RequestedAt).HasColumnName("requested_at").IsRequired();
+            b.Property(x => x.StartedAt).HasColumnName("started_at");
+            b.Property(x => x.CompletedAt).HasColumnName("completed_at");
+            b.Property(x => x.RequestedBy).HasColumnName("requested_by").HasMaxLength(256);
+            b.Property(x => x.Error).HasColumnName("error");
+            b.Property(x => x.OrdersProcessed).HasColumnName("orders_processed");
+            b.Property(x => x.OrdersFullyAllocated).HasColumnName("orders_fully_allocated");
+            b.Property(x => x.OrdersPartiallyAllocated).HasColumnName("orders_partially_allocated");
+            b.Property(x => x.Results).HasColumnName("results").HasColumnType("text");
+
+            // Worker query: SELECT pending runs ordered by submission time.
+            b.HasIndex(x => new { x.Status, x.RequestedAt })
+                .HasDatabaseName("idx_allocation_runs_status_requested_at");
         });
     }
 }

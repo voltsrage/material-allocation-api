@@ -1,3 +1,5 @@
+using Microsoft.AspNetCore.Mvc;
+
 public record AllocationLineResult(
     Guid SkuId,
     string SkuCode,
@@ -44,3 +46,49 @@ public record AllocationEventResponse(
     int Quantity,
     DateTime OccurredAt
 );
+
+// Returned immediately by POST /allocations/run
+public record AllocationRunAcceptedResponse(Guid RunId);
+
+// Returned by GET /allocations/runs/{id}
+public record AllocationRunStatusResponse(
+    Guid RunId,
+    string Status,
+    DateTime RequestedAt,
+    DateTime? StartedAt,
+    DateTime? CompletedAt,
+    string? RequestedBy,
+    string? Error,
+    int? OrdersProcessed,
+    int? OrdersFullyAllocated,
+    int? OrdersPartiallyAllocated,
+    IReadOnlyList<AllocationRunResult>? Results
+);
+
+// Returned by GET /allocations/runs (list)
+// Parameter order must match the SQL column order in ListRecentAsync — Dapper
+// matches positional-record constructors by name AND position.
+public record AllocationRunSummary
+(
+    Guid RunId,
+    string Status,
+    DateTime RequestedAt,
+    DateTime? CompletedAt,
+    int? OrdersProcessed
+);
+
+public record EnqueueResult
+{
+    public record Accepted(AllocationRun Run) : EnqueueResult;
+    public record Conflict(Guid Id, string Status) : EnqueueResult;
+
+    public IActionResult Match(
+        Func<Accepted, IActionResult> onAccepted,
+        Func<Conflict, IActionResult> onConflict
+    ) => this switch
+    {
+        Accepted a => onAccepted(a),
+        Conflict c => onConflict(c),
+        _ => throw new InvalidOperationException()
+    };
+}

@@ -58,7 +58,7 @@ Every time units move — committed, released, or soft-held — an `AllocationEv
 - **Availability Query** — `GET /skus/{id}/availability` returns `on_hand`, `reserved`, and `available = on_hand - reserved` in one read
 - **Order Management** — create orders with one or more lines referencing existing SKUs; paginated list with optional `status` filter; unique `reference_code` enforced at DB level
 - **Allocation Run** — `POST /orders/{id}/allocate` fills open lines against current stock in a single transaction; pessimistic `SELECT … FOR UPDATE` on SKU rows in deterministic (sku_id ascending) order prevents deadlocks; partial allocation allowed — unfulfilled lines remain open; response states partial vs. full explicitly
-- **Priority Allocation Run** — `POST /allocations/run` processes every non-terminal order in a single call, in priority order (`critical` → `high` → `standard`); within a tier, older orders are served first (FIFO); each order allocates in its own transaction so all Phase 4 locking invariants hold; returns aggregated stats (`ordersProcessed`, `ordersFullyAllocated`, `ordersPartiallyAllocated`) plus a per-order result list
+- **Async Priority Allocation Run** — `POST /allocations/run` returns `202 Accepted` immediately with a `runId`; a background worker (`AllocationRunWorker`) claims the run via `SELECT … FOR UPDATE SKIP LOCKED`, executes the priority-ordered allocation loop, and persists the outcome; `GET /allocations/runs/{id}` polls status (`pending` → `running` → `completed` | `failed`) and returns aggregated stats (`ordersProcessed`, `ordersFullyAllocated`, `ordersPartiallyAllocated`) and a per-order result list once complete; `GET /allocations/runs` lists the 20 most recent runs newest-first; `409` is returned if a run is already `pending` or `running` — the response body includes the in-progress run ID so the caller can poll it instead of retrying blindly; `AllocationRunHealthCheck` degrades when any run has been in `running` state for more than 15 minutes (worker may be stuck)
 - **Cancellation & Release** — `POST /orders/{id}/cancel` transitions the order to `cancelled` and atomically restores `on_hand` from each line's `allocated_qty`; cancel uses the same lock order as allocate to prevent concurrent allocation/cancel deadlocks
 - **Reservations** — `POST /orders/{id}/reserve` places a TTL-bounded hold per line against available stock; own-order reservation does not block own allocation; calling reserve again replaces the existing hold (idempotent TTL refresh)
 - **Reservation Release** — `POST /reservations/{id}/release` explicitly removes a reservation before it expires
@@ -100,6 +100,8 @@ Background workers
   → ReservationExpiryJob     (expires stale reservations; inserts reservation_expired events via CTE)
   → OutboxRelayJob           (polls outbox_messages; delivers via IEventPublisher; marks processed_at or error)
   → IdempotencyCleanupJob    (deletes expired 'complete' records and stuck 'processing' records)
+  → AllocationRunWorker      (polls allocation_runs for pending rows via SKIP LOCKED; executes
+                               RunPriorityAllocationAsync; persists completed/failed outcome)
 ```
 
 Services are the only layer that touches the database. Controllers translate HTTP concerns (query params, status codes, response envelope) and delegate all business logic to the service layer. EF Core handles writes, aggregate loads, and raw-SQL locking queries; Dapper is used for multi-result read queries (order details with lines, paginated lists) where the result shape doesn't map cleanly to aggregate roots.
@@ -112,7 +114,7 @@ Services are the only layer that touches the database. Controllers translate HTT
 | Database | PostgreSQL 15+ with EF Core 8 (code-first migrations) |
 | Micro-ORM | Dapper 2.1 |
 | Logging | Serilog — structured logs to Console + Seq; enriched with `MachineName`, `ThreadId`, `CorrelationId` |
-| Background workers | `BackgroundService` (`ReservationExpiryJob`, `OutboxRelayJob`) |
+| Background workers | `BackgroundService` (`ReservationExpiryJob`, `OutboxRelayJob`, `IdempotencyCleanupJob`, `AllocationRunWorker`) |
 | Auth | JWT Bearer (`Microsoft.AspNetCore.Authentication.JwtBearer`); HMAC-SHA256 signed tokens |
 | Docs | Swagger / OpenAPI (Swashbuckle) with XML doc comments and JWT Bearer security definition |
 | Testing | xUnit + `WebApplicationFactory<Program>` — real Postgres database |
@@ -140,7 +142,8 @@ MaterialAllocationApi/
 │   ├── Reservation.cs
 │   ├── AllocationEvent.cs                  # Immutable ledger row — EventType, OrderId, OrderLineId, SkuId, Quantity, OccurredAt
 │   ├── OutboxMessage.cs                    # processing / complete state; MarkProcessed(), MarkFailed(error)
-│   └── IdempotencyRecord.cs               # IdempotencyKey, RequestPath, Status (processing|complete), ResponseStatus, ResponseBody, ExpiresAt; Complete()
+│   ├── IdempotencyRecord.cs               # IdempotencyKey, RequestPath, Status (processing|complete), ResponseStatus, ResponseBody, ExpiresAt; Complete()
+│   └── AllocationRun.cs                   # pending→running→completed|failed state machine; MarkRunning(), Complete(response, json), Fail(error)
 ├── Domain/Enums/
 │   ├── OrderPriority.cs
 │   ├── OrderStatus.cs
@@ -150,7 +153,7 @@ MaterialAllocationApi/
 ├── Models/Records/
 │   ├── SkuRecords.cs                       # CreateSkuRequest / AdjustSkuRequest / SkuResponse
 │   ├── OrderRecords.cs                     # CreateOrderRequest / OrderResponse / OrderSummaryResponse
-│   ├── AllocationRecords.cs                # AllocationResponse / AllocationLineResult / AvailabilityResponse / AllocationRunResponse / AllocationRunResult / AllocationEventResponse
+│   ├── AllocationRecords.cs                # AllocationResponse / AllocationLineResult / AvailabilityResponse / AllocationRunResponse / AllocationRunResult / AllocationEventResponse / AllocationRunAcceptedResponse / AllocationRunStatusResponse / AllocationRunSummary / EnqueueResult (discriminated union)
 │   ├── ReservationRecords.cs               # ReserveRequest / ReservationResponse / ReservationLineResult
 │   ├── RollupRecords.cs                    # SkuShortageResponse
 │   └── AuthRecords.cs                      # TokenRequest / TokenResponse
@@ -159,6 +162,7 @@ MaterialAllocationApi/
 │   │   ├── ISkuService.cs
 │   │   ├── IOrderService.cs
 │   │   ├── IAllocationService.cs
+│   │   ├── IAllocationRunService.cs        # EnqueueAsync → EnqueueResult; GetByIdAsync; ListRecentAsync
 │   │   ├── IReservationService.cs
 │   │   ├── IRollupService.cs
 │   │   ├── IEventPublisher.cs              # PublishAsync(OutboxMessage) — implemented by LoggingEventPublisher
@@ -166,15 +170,19 @@ MaterialAllocationApi/
 │   ├── SkuService.cs                       # Create, GetById, List, AdjustAsync (optimistic concurrency)
 │   ├── OrderService.cs                     # Create, GetById, List, CancelAsync (TX + FOR UPDATE); emits AllocationReleased events + outbox
 │   ├── AllocationService.cs                # AllocateAsync (TX + FOR UPDATE), GetAvailabilityAsync, RunPriorityAllocationAsync, GetEventsAsync; emits AllocationCommitted events + outbox
+│   ├── AllocationRunService.cs             # EnqueueAsync (EF Core write); GetByIdAsync / ListRecentAsync (Dapper reads); JSON deserialise results
 │   ├── ReservationService.cs               # ReserveAsync (TX + FOR UPDATE), ReleaseAsync, ExpireAsync (CTE); emits Reservation* events + outbox
-│   ├── ReservationExpiryJob.cs             # BackgroundService — CTE: DELETE + INSERT allocation_events in one query
 │   ├── RollupService.cs                    # GetSkuShortageAsync — Dapper CTE, no writes
 │   ├── EventPublisher.cs                   # LoggingEventPublisher: logs event type + payload; swap for Kafka/SNS in production
-│   ├── OutboxRelayJob.cs                   # BackgroundService — polls outbox_messages; delivers via IEventPublisher; marks processed_at or error
 │   ├── JwtTokenService.cs                  # IssueToken — HMAC-SHA256 signed JWT with role claim; expiry from AuthSettings
 │   └── IdempotencyCleanupJob.cs            # BackgroundService — deletes expired 'complete' records and stuck 'processing' records
+├── Jobs/
+│   ├── AllocationRunWorker.cs              # BackgroundService — polls pending runs via FOR UPDATE SKIP LOCKED; calls RunPriorityAllocationAsync; persists completed/failed; configurable PollIntervalSeconds
+│   ├── ReservationExpiryJob.cs             # BackgroundService — CTE: DELETE + INSERT allocation_events in one query
+│   ├── OutboxRelayJob.cs                   # BackgroundService — polls outbox_messages; delivers via IEventPublisher; marks processed_at or error
+│   └── IdempotencyCleanupJob.cs            # BackgroundService — deletes expired 'complete' records and stuck 'processing' records
 ├── Data/
-│   ├── AllocationDbContext.cs              # EF Core context — entity configs, indexes, CHECK constraints; OutboxMessages DbSet
+│   ├── AllocationDbContext.cs              # EF Core context — entity configs, indexes, CHECK constraints; AllocationRuns DbSet added
 │   ├── IDbConnectionFactory.cs / NpgsqlConnectionFactory.cs
 │   ├── TransactionHelper.cs                # RollbackAsync — safe rollback that swallows secondary exceptions
 │   └── Seed/SkuSeeder.cs                   # Seeds 5 memory/NAND SKUs on first startup (idempotent)
@@ -187,7 +195,8 @@ MaterialAllocationApi/
 │   │   ├── OutboxRelaySettings.cs          # IntervalSeconds, BatchSize
 │   │   └── IdempotencySettings.cs          # ExpiryHours, CleanupIntervalSeconds, StuckProcessingAgeMinutes
 │   ├── Health/
-│   │   └── OutboxLagHealthCheck.cs         # Degraded when oldest unprocessed outbox message > 2 minutes old
+│   │   ├── OutboxLagHealthCheck.cs         # Degraded when oldest unprocessed outbox message > 2 minutes old
+│   │   └── AllocationRunHealthCheck.cs     # Degraded when any run has been in 'running' state > 15 minutes
 │   ├── Swagger/
 │   │   └── IdempotencyHeaderOperationFilter.cs  # Adds optional Idempotency-Key header to all POST operations in Swagger UI
 │   └── Exceptions/
@@ -202,13 +211,18 @@ MaterialAllocationApi/
 
 MaterialAllocationApi.Tests/
 ├── Fixtures/
-│   └── ApiFixture.cs                       # WebApplicationFactory<Program>; MigrateAsync on init; ResetDatabaseAsync between tests;
-│                                           # removes OutboxRelayJob from test host; replaces JWT Bearer with TestAuthHandler
+│   └── ApiFixture.cs                       # WebApplicationFactory<Program>; MigrateAsync on init; ResetDatabaseAsync between tests
+│                                           # (including allocation_runs); removes OutboxRelayJob + AllocationRunWorker from test host;
+│                                           # replaces JWT Bearer with TestAuthHandler
 ├── Helpers/
-│   └── AllocationTestBase.cs               # HTTP helpers (CreateSkuAsync, CreateOrderAsync, AllocateAsync, …); DB assertion helpers;
+│   └── AllocationTestBase.cs               # HTTP helpers (CreateSkuAsync, CreateOrderAsync, AllocateAsync, SubmitAllocationRunAsync,
+│                                           # PollRunUntilCompleteAsync, TriggerAllocationWorkerAsync); DB assertion helpers;
 │                                           # AuthorizeAs(roles) / AuthorizeAsAll() role-header helpers
 ├── Allocation/
 │   ├── AllocationFlowTests.cs              # Partial allocation, sequential top-up, over-demand, priority run (critical before standard)
+│   ├── AllocationRunTests.cs               # 9 async run lifecycle tests: 202 + poll, state transitions, per-order results, 409 conflict,
+│   │                                       # 202-after-complete, 404 unknown ID, list newest-first, zero-orders run,
+│   │                                       # fault injection (IAllocationService override via WithWebHostBuilder)
 │   ├── ConcurrentAllocationTests.cs        # Two parallel allocates on the same SKU — exactly one wins
 │   ├── CancelTests.cs                      # Cancel + inventory restoration; cancel with no allocations
 │   ├── ReservationTests.cs                 # Reserve, block, own-order exception, TTL refresh, release, expiry, cancel-deletes
@@ -216,6 +230,8 @@ MaterialAllocationApi.Tests/
 ├── Auth/
 │   ├── TestAuthHandler.cs                  # Fake auth scheme: reads X-Test-Role header; returns NoResult() (→ 401) when absent
 │   └── RbacTests.cs                        # 19 RBAC tests: anonymous token endpoint, 401 on no auth, 403 on wrong role, 2xx on correct role
+├── Idempotency/
+│   └── IdempotencyTests.cs                 # Idempotency middleware integration tests
 ├── Outbox/
 │   └── OutboxPatternTests.cs               # 8 outbox tests: written on allocation/cancel/reserve/release/expiry, relay marks processed, relay records error, atomicity
 └── Rollup/
@@ -309,6 +325,9 @@ Edit `appsettings.json`:
     "ExpiryHours": 24,
     "CleanupIntervalSeconds": 3600,
     "StuckProcessingAgeMinutes": 5
+  },
+  "AllocationRunWorker": {
+    "PollIntervalSeconds": 5
   }
 }
 ```
@@ -526,22 +545,43 @@ Returns 204 on success, 404 if the reservation does not exist.
 
 ### Allocations
 
-| Method | Path | Description |
-|---|---|---|
-| POST | `/allocations/run` | Run priority-aware allocation across all open orders |
+| Method | Path | Role | Description |
+|---|---|---|---|
+| POST | `/allocations/run` | `allocation-manager` | Enqueue a priority-aware allocation run |
+| GET | `/allocations/runs/{id}` | any-auth | Poll status and results of a run by ID |
+| GET | `/allocations/runs` | any-auth | List the 20 most recent runs, newest first |
 
 **POST `/allocations/run`**
 
-No request body required. Processes all orders with status `open` or `partially_allocated` in priority order (`critical` → `high` → `standard`); within a tier, older orders are served first. Each order runs through its own transaction using the same `SELECT … FOR UPDATE` locking as `POST /orders/{id}/allocate`. Orders that become terminal (cancelled or fully allocated by a concurrent request) between the initial query and the lock are skipped gracefully.
+No request body required. Returns `202 Accepted` immediately with a `runId`. A background worker (`AllocationRunWorker`) picks up the run within its configured poll interval (`AllocationRunWorker:PollIntervalSeconds`, default 5 s), claims it with `SELECT … FOR UPDATE SKIP LOCKED` (safe for multi-replica deployments), executes the priority-ordered allocation loop, and persists the outcome.
+
+Returns `409 RUN_IN_PROGRESS` if a run is already `pending` or `running`; the response body contains the in-progress run ID.
+
+202 response:
+
+| Field | Type | Description |
+|---|---|---|
+| `runId` | Guid | ID to poll via `GET /allocations/runs/{runId}` |
+
+**GET `/allocations/runs/{id}`**
+
+Poll until `status` is `completed` or `failed`. `startedAt` and `completedAt` are populated as the run progresses.
 
 Response:
 
 | Field | Type | Description |
 |---|---|---|
-| `ordersProcessed` | int | Total orders evaluated in this run |
-| `ordersFullyAllocated` | int | Orders whose status is `fully_allocated` after this run |
-| `ordersPartiallyAllocated` | int | Orders that received some stock but still have open lines |
-| `results` | array | Per-order result (see below) |
+| `runId` | Guid | Run ID |
+| `status` | string | `pending` \| `running` \| `completed` \| `failed` |
+| `requestedAt` | DateTime | UTC — when the run was enqueued |
+| `startedAt` | DateTime? | UTC — when the worker claimed the run; null while `pending` |
+| `completedAt` | DateTime? | UTC — when the run finished; null until terminal |
+| `requestedBy` | string? | Identity of the caller who submitted the run |
+| `error` | string? | Error message when `status = 'failed'`; null otherwise |
+| `ordersProcessed` | int? | Total orders evaluated; null until `completed` |
+| `ordersFullyAllocated` | int? | Orders reaching `fully_allocated`; null until `completed` |
+| `ordersPartiallyAllocated` | int? | Orders that received partial stock; null until `completed` |
+| `results` | array? | Per-order result list; null until `completed` (see below) |
 
 Per-order result:
 
@@ -553,11 +593,28 @@ Per-order result:
 | `status` | string | Order status after this run |
 | `isFullyAllocated` | bool | Whether all lines are now satisfied |
 
+**GET `/allocations/runs`**
+
+Returns the 20 most recent runs, newest first (`requestedAt DESC`).
+
+Per-item:
+
+| Field | Type | Description |
+|---|---|---|
+| `runId` | Guid | Run ID |
+| `status` | string | `pending` \| `running` \| `completed` \| `failed` |
+| `requestedAt` | DateTime | UTC |
+| `completedAt` | DateTime? | UTC; null while in-progress |
+| `ordersProcessed` | int? | null until `completed` |
+
 **Status codes:**
 
 | Code | Meaning |
 |---|---|
-| 200 | Run complete — inspect per-order `results` for individual outcomes |
+| 202 | Run accepted — poll `GET /allocations/runs/{runId}` for status |
+| 200 | OK (GET endpoints) |
+| 404 | No run with the given ID |
+| 409 | `RUN_IN_PROGRESS` — a run is already pending or running; response body contains the in-progress run ID |
 
 ---
 
@@ -754,6 +811,26 @@ expiresAt       DateTimeOffset  createdAt + IdempotencySettings.ExpiryHours (def
 
 Indexes: `idempotencyKey` unique (primary concurrency guard), `expiresAt` (cleanup job range scan)
 
+### AllocationRun
+
+```
+id                      Guid     PK
+status                  string   pending | running | completed | failed
+requestedAt             DateTime UTC — when the run was enqueued
+startedAt               DateTime? UTC — when the worker claimed the run; null while pending
+completedAt             DateTime? UTC — when the run finished; null until terminal
+requestedBy             string?  identity of the caller who submitted the run
+error                   string?  error message when status = 'failed'; null otherwise
+ordersProcessed         int?     total orders evaluated; null until completed
+ordersFullyAllocated    int?     orders reaching fully_allocated; null until completed
+ordersPartiallyAllocated int?   orders that received partial stock; null until completed
+results                 jsonb?   serialised AllocationRunResult[] per-order outcome list; null until completed
+```
+
+`AllocationRunWorker` uses `SELECT … FOR UPDATE SKIP LOCKED` to claim `pending` rows atomically — safe for multi-replica deployments. `AllocationRunHealthCheck` degrades when any row has been in `running` state for more than 15 minutes.
+
+Indexes: `status` (worker poll query), `requestedAt DESC` (list endpoint)
+
 ---
 
 ## Pagination
@@ -811,3 +888,4 @@ On first startup, 5 representative memory and NAND SKUs are seeded automatically
 | 12 | Transactional outbox — `outbox_messages` table (`event_type`, `payload jsonb`, `processed_at`, `error`); `OutboxMessage` entity with `MarkProcessed()` / `MarkFailed(error)`; outbox row written inside the same `SaveChangesAsync` as every domain write (allocation, cancel, reserve, release, expiry); `OutboxRelayJob` `BackgroundService` polls unprocessed rows in batches, publishes via `IEventPublisher`, marks `processed_at` on success or records `error` on failure; `LoggingEventPublisher` logs event + payload (drop-in for Kafka/SNS); `OutboxLagHealthCheck` reports degraded when oldest unprocessed message > 2 min; 8 integration tests covering write, relay, failure recording, and atomicity | Done |
 | 13 | JWT auth + RBAC — `POST /api/v1/auth/token` (`[AllowAnonymous]`) issues HMAC-SHA256 signed JWTs for a requested role; JWT Bearer validation in `Program.cs`; `[Authorize]` on all controllers; four role-restricted scopes: `warehouse-ops` (SKU writes), `sales-ops` (order create/cancel), `allocation-manager` (allocate, reserve, release, run), read-only GET access requires only authentication; `TestAuthHandler` in test project replaces JWT validation with `X-Test-Role` header; `AuthorizeAs()` / `AuthorizeAsAll()` helpers on `AllocationTestBase`; 19 RBAC integration tests covering 401, 403, and 2xx for all roles | Done |
 | 14 | Idempotency — `idempotency_keys` table with unique index on `idempotency_key`; `IdempotencyMiddleware` claims keys via atomic DB insert; buffers 2xx/4xx responses and replays them on duplicate requests with `X-Idempotency-Replayed: true`; `409 IDEMPOTENCY_IN_FLIGHT` on concurrent in-flight duplicates; `422 IDEMPOTENCY_KEY_MISMATCH` on path reuse; 5xx outcomes not stored (client-retry safe); `IdempotencyCleanupJob` purges expired `complete` records and stuck `processing` records; `IdempotencySettings` (`ExpiryHours`, `CleanupIntervalSeconds`, `StuckProcessingAgeMinutes`); `IdempotencyHeaderOperationFilter` exposes optional header on all qualifying `POST` operations in Swagger UI | Done |
+| 15 | Async allocation run — `POST /allocations/run` returns `202 Accepted` immediately with a `runId` instead of blocking; `allocation_runs` table with `pending → running → completed \| failed` state machine; `AllocationRunWorker` (`BackgroundService`) polls via `SELECT … FOR UPDATE SKIP LOCKED` (multi-replica safe), calls `RunPriorityAllocationAsync`, persists aggregated stats (`ordersProcessed`, `ordersFullyAllocated`, `ordersPartiallyAllocated`) and per-order JSON results; `GET /allocations/runs/{id}` status poll endpoint; `GET /allocations/runs` lists 20 most recent runs newest-first; `409 RUN_IN_PROGRESS` when a run is already active (response body contains in-progress run ID); `AllocationRunHealthCheck` degrades when any run has been `running` > 15 min (stuck worker detection); `IAllocationRunService` with `EnqueueResult` discriminated union (`Accepted` / `Conflict`); 9 integration tests covering 202+poll, state transitions, per-order results, 409 conflict, 202-after-complete, 404 unknown ID, list newest-first, zero-orders run, and fault injection via `WithWebHostBuilder` service override | Done |

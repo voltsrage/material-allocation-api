@@ -35,6 +35,18 @@ public class ApiFixture : WebApplicationFactory<Program>, IAsyncLifetime
             if (descriptor != null)
                 services.Remove(descriptor);
 
+            // Remove the allocation run worker from the test host.
+            // Its 5-second poll interval is longer than the test's total polling window,
+            // making timing non-deterministic and causing stale runs from previous sessions
+            // to interfere with the current test.
+            // Tests that need to exercise allocation run behaviour call
+            // TriggerAllocationWorkerAsync() directly, which invokes one processing cycle
+            // on demand via reflection — mirroring the OutboxRelayJob pattern above.
+            var workerDescriptor = services.SingleOrDefault(
+                d => d.ImplementationType == typeof(AllocationRunWorker));
+            if (workerDescriptor != null)
+                services.Remove(workerDescriptor);
+
             // Replace JWT Bearer with the test handler so tests don't need real tokens.
             // Auth enforcement (401/403) is still active — only the token format changes.
             services.AddAuthentication(TestAuthHandler.SchemeName)
@@ -59,7 +71,9 @@ public class ApiFixture : WebApplicationFactory<Program>, IAsyncLifetime
         var db = scope.ServiceProvider.GetRequiredService<AllocationDbContext>();
 
         // Delete in reverse FK dependency order.
-        // outbox_messages has no FK constraints — safe to clear at any point.
+        // idempotency_keys and outbox_messages have no FK constraints — safe to clear at any point.
+        await db.Database.ExecuteSqlRawAsync("DELETE FROM allocation_runs");
+        await db.Database.ExecuteSqlRawAsync("DELETE FROM idempotency_keys");
         await db.Database.ExecuteSqlRawAsync("DELETE FROM outbox_messages");
         // allocation_events has RESTRICT FKs to order_lines, orders, and skus,
         // so it must be deleted before any of those three tables.

@@ -133,14 +133,17 @@ public class AllocationFlowTests(ApiFixture fixture) : AllocationTestBase(fixtur
         var standardOrderId = await CreateOrderAsync("ORD-STD", skuId, requestedQty: 5, priority: "standard");
         var criticalOrderId = await CreateOrderAsync("ORD-CRIT", skuId, requestedQty: 5, priority: "critical");
 
-        var result = await Client.PostAsync("/api/v1/allocations/run", null);
-        result.EnsureSuccessStatusCode();
+        var runId = await SubmitAllocationRunAsync();
+        await TriggerAllocationWorkerAsync();
+        var run   = await PollRunUntilCompleteAsync(runId);
+
+        Assert.Equal("completed", run.Status);
 
         var criticalOrder = await GetOrderAsync(criticalOrderId);
         var standardOrder = await GetOrderAsync(standardOrderId);
 
         Assert.Equal("fully_allocated", criticalOrder.Status);
-        Assert.Equal("open", standardOrder.Status);
+        Assert.Equal("open",            standardOrder.Status);
         Assert.Equal(0, standardOrder.Lines[0].AllocatedQty);
-}
+    }
 }

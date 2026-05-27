@@ -281,13 +281,14 @@ public class RbacTests(ApiFixture fixture) : AllocationTestBase(fixture)
     }
 
     [Fact]
-    public async Task AllocationManager_RunAllocation_Returns200()
+    public async Task AllocationManager_RunAllocation_Returns202()
     {
         AuthorizeAs("allocation-manager");
 
         var response = await Client.PostAsync("/api/v1/allocations/run", null);
 
-        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        // Phase 15 made this endpoint async: it returns 202 Accepted + run ID immediately.
+        Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
     }
 
     [Fact]
