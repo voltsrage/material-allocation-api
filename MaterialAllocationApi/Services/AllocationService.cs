@@ -19,6 +19,12 @@ public class AllocationService : IAllocationService
 
     public async Task<AllocationResponse> AllocateAsync(Guid orderId, CancellationToken ct = default)
     {
+        return await AllocateCappedAsync(orderId, null, ct);
+    }
+
+    private async Task<AllocationResponse> AllocateCappedAsync(
+        Guid orderId, IReadOnlyDictionary<Guid,int>? skuCapOverrides, CancellationToken ct = default)
+    {
         // 1. Load the order and lines outside the transaction
         // Status check here is a fast pre-flight - the real guard is the locked state
         // inside the transaction, but we avoid acquiring locks for obviously invalid orders.
@@ -102,6 +108,9 @@ public class AllocationService : IAllocationService
                 var available = Math.Max(0, sku.OnHand - othersHeld);
                 var canAllocate = Math.Min(available, remaining);
 
+                if(skuCapOverrides is not null && skuCapOverrides.TryGetValue(line.SkuId, out var cap))
+                    canAllocate = Math.Min(canAllocate, cap);
+
                 if(canAllocate > 0)
                 {
                     // AllocateUnits decrements on_hand; Allocate increments allocated_qty.
@@ -119,7 +128,8 @@ public class AllocationService : IAllocationService
                     sku.SkuCode,
                     line.RequestedQty,
                     line.AllocatedQty,
-                    line.RequestedQty - line.AllocatedQty
+                    line.RequestedQty - line.AllocatedQty,
+                    canAllocate // ThisRunQty - canAllocate is exactly what was allocated this call
                 ));
             }
 
@@ -153,8 +163,8 @@ public class AllocationService : IAllocationService
             await tx.CommitAsync(ct);
 
             _logger.LogInformation(
-                "Order {OrderId} allocated: status={Status}, lines={LineCount}, fullyAllocated={IsFullyAllocated}",
-                orderId, order.Status.ToDbString(), results.Count, order.Status == OrderStatus.FullyAllocated);
+                "Order {OrderId} allocated: status={Status}, lines={LineCount}, capped={IsCapped}.",
+                orderId, order.Status.ToDbString(), results.Count, skuCapOverrides is not null);
 
             return new AllocationResponse(
                 order.Id,
@@ -238,8 +248,22 @@ public class AllocationService : IAllocationService
     */
     public async Task<AllocationRunResponse> RunPriorityAllocationAsync(CancellationToken ct = default)
     {
-        // Fetch all the order that are not fully allocated
-        // or cancelled, ordered so that 'Critical' comes first, then 'High', then 'Standard', within a tier, older orders are processed first.
+        var today = DateOnly.FromDateTime(DateTime.UtcNow);
+
+        // Load active contracts. Tier1 first (contractual obligations are highest priority).
+        // then tier 2, the floor_qty descending with each tier(largest commitments first).
+        var activeContracts = await _db.CustomerContracts
+            .Include(c => c.Customer)
+            .Where(c => 
+                c.EffectiveFrom <= today &&
+                (c.EffectiveTo == null || c.EffectiveTo >= today)
+            )
+            .OrderBy(c => c.Customer.Tier == CustomerTier.Tier3 ?  0:
+                c.Customer.Tier == CustomerTier.Tier2 ? 1 : 2)
+            .ThenByDescending(c => c.FloorQty)
+            .ToListAsync(ct);
+
+        // Load all open orders in priority order. This list is the input for both passes
         var openOrders = await _db.Orders
             .Include(o => o.Lines)
             .Where(o => o.Status != OrderStatus.FullyAllocated && o.Status != OrderStatus.Cancelled)
@@ -248,31 +272,145 @@ public class AllocationService : IAllocationService
             .ThenBy(o => o.CreatedAt)
             .ToListAsync();
 
-        // Each order runs through the existing 'AllocateAsync' logic
-        // Sequencing is enforced at the application layer - no database-level priority mechanism is needed.
-        // Because each call acquires its own 'FOR UPDATE' locks an commits independently,
-        // the invariants from Phase 4 hold exactly as before.
+        // resultMap collects one entry per order, updated on each AllocatedCappedAsync call
+        var resultMap = new Dictionary<Guid, AllocationRunResult>();
 
-        var results = new List<AllocationRunResult>();
+        // ceilingSpent[customerId, skuId] = units allocated on each AllocationCappedAsync call
+        // across the entire run (floor pass + priority pass combined)
+        var ceilingSpent = new Dictionary<(Guid, Guid), int>();
+
+        /*
+        FLOOR PASS: honor contractual minimums before any priority ordering
+        For reach active contract, allocate up to floor_qty across the customer's
+        open orders for that SKU, in order priority order
+        */
+        foreach(var contract in activeContracts)
+        {
+            var remainingFloor = contract.FloorQty;
+
+            var customerOrders = openOrders
+                .Where(o => 
+                    o.CustomerId == contract.CustomerId &&
+                    o.Status != OrderStatus.FullyAllocated &&
+                    o.Status != OrderStatus.Cancelled &&
+                    o.Lines.Any(l => l.SkuId == contract.SkuId)
+                ).ToList(); // inherits the priority + created_at sort from openOrders
+
+            foreach(var order in customerOrders)
+            {
+                if(remainingFloor <= 0) break;
+
+                var skuCap = new Dictionary<Guid,int>{[contract.CustomerId] = remainingFloor};
+
+                try
+                {
+                    var result = await AllocateCappedAsync(order.Id, skuCap, ct);
+
+                    foreach(var line in result.Lines)
+                    {
+                        if(line.ThisRunQty <= 0) continue;
+
+                        var key = (contract.CustomerId, line.SkuId);
+
+                        ceilingSpent[key] = ceilingSpent.GetValueOrDefault(key) + line.ThisRunQty;
+
+                        if(line.SkuId == contract.SkuId)
+                            remainingFloor -= line.ThisRunQty;
+                    }
+
+                    resultMap[order.Id] = new AllocationRunResult(
+                        order.Id,
+                        order.ReferenceCode,
+                        order.Priority.ToDbString(),
+                        result.Status,
+                        result.IsFullyAllocated
+                    );
+                }
+                catch (ConflictException)
+                {
+                    resultMap[order.Id] = new AllocationRunResult(
+                        order.Id,
+                        order.ReferenceCode,
+                        order.Priority.ToDbString(),
+                        order.Status.ToDbString(),
+                        order.Status ==  OrderStatus.FullyAllocated
+                    );
+                }
+            }
+        }
+
+        /*
+        PRIORITY PASS: allocate remaining supply in priority order.
+        For orders belonging to a customer with a ceiling, compute the remaining
+        headroom as (ceiling - ceilingSpent) and pass it as a per-SKU cap.
+        Orders with no customer or no ceiling are uncapped
+        */
+
+        // Build a lookup of active contracts by customerId ID for fast ceiling checks
+        var contractsByCustomer = activeContracts
+            .Where(c => c.CeilingQty.HasValue)
+            .GroupBy(c=> c.CustomerId)
+            .ToDictionary(g => g.Key, g => g.ToList());   
 
         foreach(var order in openOrders)
         {
-            try
+            // EF tracking: order.Status and order.Lines.AllocatedQty were updated in memory
+            // by AllocateCappedAsync calls in the floor pass (same DbContext instance)
+            if(order.Status == OrderStatus.FullyAllocated || order.Status == OrderStatus.Cancelled)
             {
-                var result = await AllocateAsync(order.Id, ct);
-                results.Add(new AllocationRunResult(
+                // Already terminal; ensure it appears in results even if floor pass missed it
+                resultMap.TryAdd(order.Id, new AllocationRunResult(
                     order.Id,
                     order.ReferenceCode,
                     order.Priority.ToDbString(),
-                    result.Status,
-                    result.IsFullyAllocated
+                    order.Status.ToDbString(),
+                    order.Status == OrderStatus.FullyAllocated
                 ));
+            }
+
+            IReadOnlyDictionary<Guid, int>? skuCaps = null;
+
+            if(order.CustomerId.HasValue &&
+                contractsByCustomer.TryGetValue(order.CustomerId.Value, out var customerContracts)
+            )
+            {
+                var caps = new Dictionary<Guid, int>();
+
+                foreach(var contract in customerContracts)
+                {
+                    var spent = ceilingSpent.GetValueOrDefault((order.CustomerId.Value, contract.SkuId));
+                    var headroom = contract.CeilingQty!.Value - spent;
+                    caps[contract.SkuId] = Math.Max(0, headroom);
+                }
+
+                if(caps.Count > 0) skuCaps = caps;
+            }
+
+            try
+            {
+                var result = await AllocateCappedAsync(order.Id, skuCaps, ct);
+
+                if (order.CustomerId.HasValue)
+                {
+                    foreach(var line in result.Lines.Where(l => l.ThisRunQty > 0))
+                    {
+                        var key = (order.CustomerId.Value, line.SkuId);
+                        ceilingSpent[key] = ceilingSpent.GetValueOrDefault(key) + line.ThisRunQty; 
+                    }
+                }
+
+                resultMap[order.Id] = new AllocationRunResult(
+                    order.Id,
+                    order.ReferenceCode,
+                    order.Priority.ToDbString(),
+                    order.Status.ToDbString(),
+                    order.Status == OrderStatus.FullyAllocated
+                );
             }
             catch (ConflictException)
             {
-                // ORDER_FULLY_ALLOCATED or ORDER_CANCELLED between the query above and the lock.
-                // Safe to skip - the order's status in the DB is already terminal.
-                results.Add(new AllocationRunResult(
+                
+                resultMap.TryAdd(order.Id, new AllocationRunResult(
                     order.Id,
                     order.ReferenceCode,
                     order.Priority.ToDbString(),
@@ -281,6 +419,8 @@ public class AllocationService : IAllocationService
                 ));
             }
         }
+
+        var results = resultMap.Values.ToList();
 
         return new AllocationRunResponse(
             OrdersProcessed: results.Count,

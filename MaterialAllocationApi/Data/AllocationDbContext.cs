@@ -15,6 +15,7 @@ public class AllocationDbContext : DbContext
     public DbSet<IdempotencyRecord> IdempotencyRecords => Set<IdempotencyRecord>();
     public DbSet<AllocationRun> AllocationRuns => Set<AllocationRun>();
     public DbSet<Customer> Customers => Set<Customer>();
+    public DbSet<CustomerContract> CustomerContracts => Set<CustomerContract>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -252,6 +253,35 @@ public class AllocationDbContext : DbContext
             b.Property(x => x.CreatedAt).HasColumnName("created_at").IsRequired();
 
             b.HasIndex(x => x.CustomerCode).IsUnique().HasDatabaseName("idx_customers_code");
+        });
+
+        modelBuilder.Entity<CustomerContract>(b =>
+        {
+            b.ToTable("customer_contracts");
+            b.HasKey(x => x.Id);
+            b.Property(x => x.Id).HasColumnName("id").HasDefaultValueSql("gen_random_uuid()");
+            b.Property(x => x.CustomerId).HasColumnName("customer_id").IsRequired();
+            b.Property(x => x.SkuId).HasColumnName("sku_id").IsRequired();
+            b.Property(x => x.FloorQty).HasColumnName("floor_qty").IsRequired();
+            b.Property(x => x.CeilingQty).HasColumnName("ceiling_qty");
+            b.Property(x => x.EffectiveFrom).HasColumnName("effective_from").IsRequired()
+                .HasConversion(v => v.ToDateTime(TimeOnly.MinValue), v => DateOnly.FromDateTime(v));
+            b.Property(x => x.EffectiveTo).HasColumnName("effective_to")
+                .HasConversion(
+                    v => v.HasValue ? (DateTime?)v.Value.ToDateTime(TimeOnly.MinValue) : null,
+                    v => v.HasValue ? DateOnly.FromDateTime(v.Value) : null);
+            b.Property(x => x.CreatedAt).HasColumnName("created_at").IsRequired();
+
+            b.HasOne(x => x.Customer).WithMany().HasForeignKey(x => x.CustomerId)
+                .OnDelete(DeleteBehavior.Restrict);
+            b.HasOne(x => x.Sku).WithMany().HasForeignKey(x => x.SkuId)
+                .OnDelete(DeleteBehavior.Restrict);
+
+            // One active contract per (customer, SKU) at any time is not enforced at the DB level
+            // because overlapping period checks require a trigger or exclusion constraint. Phase 17
+            // enforces this in the service layer — see Step 2b.
+            b.HasIndex(x => new { x.CustomerId, x.SkuId })
+                .HasDatabaseName("idx_customer_contracts_customer_sku");
         });
     }
 }

@@ -223,4 +223,29 @@ public abstract class AllocationTestBase : IAsyncLifetime
         throw new TimeoutException(
             $"Allocation run {runId} did not complete within {maxAttempts * delayMs}ms.");
     }
+
+    protected async Task<CustomerResponse> CreateCustomerAsync(
+    string code = "CUST-A",
+    CustomerTier tier = CustomerTier.Tier1)
+    {
+        var response = await Client.PostAsJsonAsync("/api/v1/customers",
+            new { customerCode = code, name = code, tier = tier.ToString().ToLowerInvariant() });
+        response.EnsureSuccessStatusCode();
+        var body = await response.Content.ReadFromJsonAsync<ApiResponse<CustomerResponse>>();
+        return body!.Data!;
+    }
+
+    protected async Task<ContractResponse> CreateContractAsync(
+        Guid customerId, Guid skuId,
+        int floorQty, int? ceilingQty = null,
+        DateOnly? effectiveFrom = null)
+    {
+        var from = effectiveFrom ?? DateOnly.FromDateTime(DateTime.UtcNow);
+        var response = await Client.PostAsJsonAsync(
+            $"/api/v1/customers/{customerId}/contracts",
+            new { skuId, floorQty, ceilingQty, effectiveFrom = from });
+        response.EnsureSuccessStatusCode();
+        var body = await response.Content.ReadFromJsonAsync<ApiResponse<ContractResponse>>();
+        return body!.Data!;
+    }
 }

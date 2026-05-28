@@ -32,13 +32,17 @@ Same response envelope and pagination as **Fleet Telemetry API** (`docs/projects
 
 ## Domain Model
 
-An **SKU** has a code, description, and **on_hand** quantity (simplified single bucket — no separate quarantine bin unless you add mid scope).
+An **SKU** has a code, description, and **on_hand** quantity (simplified single bucket). The `version` concurrency token is incremented on every write and is used to detect concurrent modifications on the adjust endpoint.
 
-An **order** has a reference, priority (`standard`, `high`, `critical`), status (`open`, `partially_allocated`, `fully_allocated`, `cancelled`), and multiple **order lines** (sku, requested qty, allocated qty).
+An **Order** has a reference, priority (`standard`, `high`, `critical`), status (`open`, `partially_allocated`, `fully_allocated`, `cancelled`), and multiple **order lines** (sku, requested qty, allocated qty). Orders optionally link to a **Customer** via a nullable FK.
 
-An **allocation event** (optional audit table) records each change for explainability.
+An **AllocationEvent** records each unit movement immutably inside the same transaction as the write, providing a full audit trail.
 
-A **reservation** (mid) holds quantity reserved for an order line until `expires_at`, after which quantity returns to availability.
+A **Reservation** holds quantity for an order line until `expires_at`; a background job expires stale rows and restores availability.
+
+A **Customer** has a unique `customerCode`, display `name`, and `tier` (`tier-1` contracted, `tier-2` partial, `tier-3` spot). The tier drives the order of the floor pass in the allocation run.
+
+A **CustomerContract** is a per-SKU allocation guarantee for a customer during a date range: `floorQty` (minimum units the allocation run must honor before any priority ordering) and optional `ceilingQty` (total cap across the run; null = uncapped). The allocation run enforces both constraints in a two-pass loop.
 
 ---
 

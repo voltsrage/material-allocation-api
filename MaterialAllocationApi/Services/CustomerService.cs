@@ -83,7 +83,7 @@ public class CustomerService : ICustomerService
         )).AsList();
 
         return new PagedResult<CustomerResponse>(items, page, pageSize, total);
-    }
+    }    
 
     private static CustomerResponse ToResponse(Customer c) =>
         new(c.Id, c.CustomerCode, c.Name, c.Tier.ToDbString(), c.CreatedAt.UtcDateTime);

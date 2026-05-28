@@ -5,7 +5,8 @@ public record AllocationLineResult(
     string SkuCode,
     int RequestedQty,
     int AllocatedQty, // total allocated across all runs (cumulative, not just this run)
-    int RemainingQty // RequestedQty - AllocatedQty after this run
+    int RemainingQty, // RequestedQty - AllocatedQty after this run
+    int ThisRunQty = 0 // units allocated in this specific AllocateAsync call
 );
 
 public record AllocationResponse(

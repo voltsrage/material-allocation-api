@@ -26,6 +26,10 @@ try
     // automatically — no column aliases needed in SQL queries.
     Dapper.DefaultTypeMap.MatchNamesWithUnderscores = true;
 
+    // DateOnly is stored as 'timestamp without time zone' (legacy migration). Dapper receives
+    // DateTime from Npgsql; this handler converts it to DateOnly for response records.
+    Dapper.SqlMapper.AddTypeHandler(new DateOnlyTypeHandler());
+
     var builder = WebApplication.CreateBuilder(args);
 
     builder.Host.UseSerilog((ctx, lc) => lc
@@ -51,6 +55,7 @@ try
     builder.Services.AddScoped<ITokenService, JwtTokenService>();
     builder.Services.AddScoped<IAllocationRunService, AllocationRunService>();
     builder.Services.AddScoped<ICustomerService, CustomerService>(); 
+    builder.Services.AddScoped<IContractService, ContractService>();
 
     builder.Services.Configure<OutboxRelaySettings>(
         builder.Configuration.GetSection("OutboxRelay")

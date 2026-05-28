@@ -57,9 +57,10 @@ Every time units move — committed, released, or soft-held — an `AllocationEv
 - **Inventory Adjustments** — signed delta adjustments with mandatory reason text; full audit trail in `inventory_adjustments`; optimistic concurrency on adjust with 409 on version conflict
 - **Availability Query** — `GET /skus/{id}/availability` returns `on_hand`, `reserved`, and `available = on_hand - reserved` in one read
 - **Customer Management** — register customers with a unique code, name, and tier (`tier1` contracted, `tier2` partial contract, `tier3` spot/priority-only); paginated list ordered by customer code; `customer_id` nullable FK on orders links every order to a customer for Phase 17 contract enforcement
+- **Customer Contracts** — per-SKU floor/ceiling allocation guarantees per customer; `POST /customers/{id}/contracts` (`[sales-ops]`) creates a dated contract with `floorQty` (minimum units the allocation run must honor before any priority ordering), optional `ceilingQty` (total cap for this customer and SKU across the entire run; null = uncapped), `effectiveFrom`, and optional `effectiveTo` (null = open-ended); the service rejects overlapping periods for the same (customer, SKU) pair; `GET /customers/{id}/contracts` lists all contracts most-recent-first; `GET /customers/{id}/contracts/utilization` returns a live snapshot of `allocatedQty` against `floorQty`/`ceilingQty` for all currently-active contracts; contracts feed the two-pass allocation run
 - **Order Management** — create orders with one or more lines referencing existing SKUs; optional `customerId` FK validated at write time; paginated list with optional `status` and `customerId` filters; `GET /orders/{id}` returns `customerCode` and `customerName` via LEFT JOIN; unique `reference_code` enforced at DB level
 - **Allocation Run** — `POST /orders/{id}/allocate` fills open lines against current stock in a single transaction; pessimistic `SELECT … FOR UPDATE` on SKU rows in deterministic (sku_id ascending) order prevents deadlocks; partial allocation allowed — unfulfilled lines remain open; response states partial vs. full explicitly
-- **Async Priority Allocation Run** — `POST /allocations/run` returns `202 Accepted` immediately with a `runId`; a background worker (`AllocationRunWorker`) claims the run via `SELECT … FOR UPDATE SKIP LOCKED`, executes the priority-ordered allocation loop, and persists the outcome; `GET /allocations/runs/{id}` polls status (`pending` → `running` → `completed` | `failed`) and returns aggregated stats (`ordersProcessed`, `ordersFullyAllocated`, `ordersPartiallyAllocated`) and a per-order result list once complete; `GET /allocations/runs` lists the 20 most recent runs newest-first; `409` is returned if a run is already `pending` or `running` — the response body includes the in-progress run ID so the caller can poll it instead of retrying blindly; `AllocationRunHealthCheck` degrades when any run has been in `running` state for more than 15 minutes (worker may be stuck)
+- **Async Priority Allocation Run** — `POST /allocations/run` returns `202 Accepted` immediately with a `runId`; a background worker (`AllocationRunWorker`) claims the run via `SELECT … FOR UPDATE SKIP LOCKED`, executes a **two-pass contract-aware** allocation loop, and persists the outcome; **floor pass** first: iterates active contracts in Tier1 → Tier2 → Tier3 order (largest `floorQty` first within each tier) and allocates up to `floorQty` units from the customer's open orders before any priority ordering — ensuring contractual minimums are honored regardless of order priority; **priority pass** second: processes all remaining open orders in `critical` → `high` → `standard` order, applying per-SKU ceiling headroom (`ceilingQty − ceilingSpent`) as a cap for contracted customers while leaving uncontracted orders uncapped; `GET /allocations/runs/{id}` polls status (`pending` → `running` → `completed` | `failed`) and returns aggregated stats (`ordersProcessed`, `ordersFullyAllocated`, `ordersPartiallyAllocated`) and a per-order result list once complete; `GET /allocations/runs` lists the 20 most recent runs newest-first; `409` is returned if a run is already `pending` or `running` — the response body includes the in-progress run ID so the caller can poll it instead of retrying blindly; `AllocationRunHealthCheck` degrades when any run has been in `running` state for more than 15 minutes (worker may be stuck)
 - **Cancellation & Release** — `POST /orders/{id}/cancel` transitions the order to `cancelled` and atomically restores `on_hand` from each line's `allocated_qty`; cancel uses the same lock order as allocate to prevent concurrent allocation/cancel deadlocks
 - **Reservations** — `POST /orders/{id}/reserve` places a TTL-bounded hold per line against available stock; own-order reservation does not block own allocation; calling reserve again replaces the existing hold (idempotent TTL refresh)
 - **Reservation Release** — `POST /reservations/{id}/release` explicitly removes a reservation before it expires
@@ -132,6 +133,7 @@ MaterialAllocationApi/
 │   ├── SkusController.cs                   # [warehouse-ops] create, adjust; any-auth get, list, availability
 │   ├── OrdersController.cs                 # [sales-ops] create, cancel; [allocation-manager] allocate, reserve; any-auth get, list, events
 │   ├── CustomersController.cs              # [sales-ops] create; any-auth get, list
+│   ├── ContractsController.cs              # [sales-ops] create; any-auth list, utilization; nested under /customers/{id}/contracts
 │   ├── AllocationController.cs             # [allocation-manager] POST /allocations/run — global priority run
 │   ├── ReservationsController.cs           # [allocation-manager] release
 │   ├── RollupController.cs                 # Any-auth GET sku-shortages
@@ -140,6 +142,7 @@ MaterialAllocationApi/
 │   ├── Sku.cs                              # AllocateUnits(), ReleaseUnits(); version concurrency token
 │   ├── InventoryAdjustment.cs
 │   ├── Customer.cs                         # customerCode (unique), name, tier; private ctor for EF
+│   ├── CustomerContract.cs                 # floorQty, ceilingQty (null=uncapped), effectiveFrom/To; IsActiveOn(date) helper; FK to Customer + Sku
 │   ├── Order.cs                            # Cancel(), RecomputeStatus() from line quantities; nullable CustomerId FK
 │   ├── OrderLine.cs                        # Allocate(), ReleasedAllocation()
 │   ├── Reservation.cs
@@ -158,7 +161,8 @@ MaterialAllocationApi/
 │   ├── SkuRecords.cs                       # CreateSkuRequest / AdjustSkuRequest / SkuResponse
 │   ├── OrderRecords.cs                     # CreateOrderRequest (+ optional CustomerId) / OrderResponse (+ CustomerId, CustomerCode, CustomerName) / OrderSummaryResponse (+ CustomerId, CustomerCode)
 │   ├── CustomerRecords.cs                  # CreateCustomerRequest / CustomerResponse
-│   ├── AllocationRecords.cs                # AllocationResponse / AllocationLineResult / AvailabilityResponse / AllocationRunResponse / AllocationRunResult / AllocationEventResponse / AllocationRunAcceptedResponse / AllocationRunStatusResponse / AllocationRunSummary / EnqueueResult (discriminated union)
+│   ├── ContractRecords.cs                  # CreateContractRequest / ContractResponse / ContractUtilizationResponse
+│   ├── AllocationRecords.cs                # AllocationResponse / AllocationLineResult (+ ThisRunQty=0) / AvailabilityResponse / AllocationRunResponse / AllocationRunResult / AllocationEventResponse / AllocationRunAcceptedResponse / AllocationRunStatusResponse / AllocationRunSummary / EnqueueResult (discriminated union)
 │   ├── ReservationRecords.cs               # ReserveRequest / ReservationResponse / ReservationLineResult
 │   ├── RollupRecords.cs                    # SkuShortageResponse
 │   └── AuthRecords.cs                      # TokenRequest / TokenResponse
@@ -166,6 +170,7 @@ MaterialAllocationApi/
 │   ├── Interfaces/
 │   │   ├── ISkuService.cs
 │   │   ├── ICustomerService.cs             # CreateAsync, GetByIdAsync, ListAsync
+│   │   ├── IContractService.cs             # CreateAsync, ListAsync, GetUtilizationAsync
 │   │   ├── IOrderService.cs
 │   │   ├── IAllocationService.cs
 │   │   ├── IAllocationRunService.cs        # EnqueueAsync → EnqueueResult; GetByIdAsync; ListRecentAsync
@@ -175,8 +180,9 @@ MaterialAllocationApi/
 │   │   └── ITokenService.cs                # IssueToken(role) — implemented by JwtTokenService
 │   ├── SkuService.cs                       # Create, GetById, List, AdjustAsync (optimistic concurrency)
 │   ├── CustomerService.cs                  # CreateAsync (EF write + unique-violation guard); GetByIdAsync, ListAsync (Dapper reads)
+│   ├── ContractService.cs                  # CreateAsync (customer/SKU existence + overlap guard, EF write, Dapper query-by-id); ListAsync; GetUtilizationAsync (live floor/ceiling vs allocated for current-date active contracts)
 │   ├── OrderService.cs                     # Create (+ customer FK validation), GetById (LEFT JOIN customers), List (+ customerId filter), CancelAsync (TX + FOR UPDATE); emits AllocationReleased events + outbox
-│   ├── AllocationService.cs                # AllocateAsync (TX + FOR UPDATE), GetAvailabilityAsync, RunPriorityAllocationAsync, GetEventsAsync; emits AllocationCommitted events + outbox
+│   ├── AllocationService.cs                # AllocateAsync (TX + FOR UPDATE); AllocateCappedAsync (private, per-SKU cap overrides); two-pass RunPriorityAllocationAsync (floor pass: contract minimums in tier+floor_qty order; priority pass: ceiling-capped remaining supply); GetAvailabilityAsync; GetEventsAsync; emits AllocationCommitted events + outbox
 │   ├── AllocationRunService.cs             # EnqueueAsync (EF Core write); GetByIdAsync / ListRecentAsync (Dapper reads); JSON deserialise results
 │   ├── ReservationService.cs               # ReserveAsync (TX + FOR UPDATE), ReleaseAsync, ExpireAsync (CTE); emits Reservation* events + outbox
 │   ├── RollupService.cs                    # GetSkuShortageAsync — Dapper CTE, no writes
@@ -189,7 +195,8 @@ MaterialAllocationApi/
 │   ├── OutboxRelayJob.cs                   # BackgroundService — polls outbox_messages; delivers via IEventPublisher; marks processed_at or error
 │   └── IdempotencyCleanupJob.cs            # BackgroundService — deletes expired 'complete' records and stuck 'processing' records
 ├── Data/
-│   ├── AllocationDbContext.cs              # EF Core context — entity configs, indexes, CHECK constraints; AllocationRuns DbSet added
+│   ├── AllocationDbContext.cs              # EF Core context — entity configs, indexes, CHECK constraints; CustomerContracts + AllocationRuns DbSets
+│   ├── DateOnlyTypeHandler.cs              # Dapper SqlMapper.TypeHandler<DateOnly> — bridges DateTime (Npgsql timestamp) → DateOnly for contract date fields
 │   ├── IDbConnectionFactory.cs / NpgsqlConnectionFactory.cs
 │   ├── TransactionHelper.cs                # RollbackAsync — safe rollback that swallows secondary exceptions
 │   └── Seed/SkuSeeder.cs                   # Seeds 5 memory/NAND SKUs on first startup (idempotent)
@@ -219,13 +226,16 @@ MaterialAllocationApi/
 MaterialAllocationApi.Tests/
 ├── Fixtures/
 │   └── ApiFixture.cs                       # WebApplicationFactory<Program>; MigrateAsync on init; ResetDatabaseAsync between tests
-│                                           # (including allocation_runs); removes OutboxRelayJob + AllocationRunWorker from test host;
+│                                           # (customer_contracts, allocation_runs, and all dependent tables deleted in FK order);
+│                                           # removes OutboxRelayJob + AllocationRunWorker from test host;
 │                                           # replaces JWT Bearer with TestAuthHandler
 ├── Helpers/
-│   └── AllocationTestBase.cs               # HTTP helpers (CreateSkuAsync, CreateOrderAsync, AllocateAsync, SubmitAllocationRunAsync,
-│                                           # PollRunUntilCompleteAsync, TriggerAllocationWorkerAsync); DB assertion helpers;
+│   └── AllocationTestBase.cs               # HTTP helpers (CreateSkuAsync, CreateOrderAsync, AllocateAsync, CreateCustomerAsync,
+│                                           # CreateContractAsync, SubmitAllocationRunAsync, PollRunUntilCompleteAsync,
+│                                           # TriggerAllocationWorkerAsync); DB assertion helpers;
 │                                           # AuthorizeAs(roles) / AuthorizeAsAll() role-header helpers
 ├── CustomerTests.cs                        # 11 tests: customer CRUD (create, duplicate 422, get by ID, 404, paginated list); order linkage (valid/null/invalid customerId, list filter, summary customerCode, allocate→cancel cycle with customerId preserved)
+├── ContractTests.cs                        # 16 tests: contract CRUD (201+all fields, 403 RBAC, 404 unknown customer/SKU, 422 negative floor/ceiling-below-floor/date-inversion/overlap); list (empty, two-contract, 404); utilization (zero before orders, post-allocation qty, 404); allocation run (ceiling enforced across multiple orders, floor guaranteed before unconstrained customers)
 ├── Allocation/
 │   ├── AllocationFlowTests.cs              # Partial allocation, sequential top-up, over-demand, priority run (critical before standard)
 │   ├── AllocationRunTests.cs               # 9 async run lifecycle tests: 202 + poll, state transitions, per-order results, 409 conflict,
@@ -272,9 +282,15 @@ available = on_hand - reserved
 
 `ReserveAsync` acquires the same `FOR UPDATE` lock on SKU rows before reading reservation totals from other orders. This guarantees that the reservation count read inside the transaction sees the latest committed state — no concurrent reserve or allocate can insert a new reservation for these SKUs between the lock acquisition and the commit.
 
-### Sequential priority ordering in the allocation run
+### Two-pass allocation run with contract enforcement
 
-`RunPriorityAllocationAsync` fetches all non-terminal orders sorted by priority (`critical` = 0, `high` = 1, `standard` = 2) then `CreatedAt`, and calls `AllocateAsync` for each sequentially. Running allocations in parallel would re-introduce the circular-wait risk that the deterministic lock order prevents within a single allocation — and would make priority ordering meaningless, since a `standard` order could grab stock before a `critical` order's transaction commits. Sequential processing is the simplest correct model at expected batch sizes; each call acquires and releases its own `FOR UPDATE` locks independently, so all Phase 4 invariants hold without modification.
+`RunPriorityAllocationAsync` uses two sequential passes sharing a single EF Core `DbContext` identity map (so in-memory order and line state stay current after each `AllocateCappedAsync` call):
+
+**Floor pass** iterates active contracts sorted by customer tier (Tier1 first, then Tier2, then Tier3 — largest contractual obligations first) and `FloorQty` descending within each tier. For each contract, it calls `AllocateCappedAsync` with a per-SKU cap equal to the remaining floor headroom, working through the customer's open orders in priority order until `floorQty` units have been allocated or demand is exhausted. Units allocated are recorded in `ceilingSpent[(customerId, skuId)]`.
+
+**Priority pass** iterates all open orders in `critical` → `high` → `standard` order then `CreatedAt`. For orders belonging to a customer with a ceiling contract, the remaining headroom (`ceilingQty − ceilingSpent`) is passed as a per-SKU cap. Orders with no customer or no ceiling contract are fully uncapped — identical to the pre-Phase 17 behaviour.
+
+All calls remain serial for the same reasons as before: running them in parallel would re-introduce the circular-wait risk that Phase 4's deterministic lock order was designed to prevent, and would make priority ordering meaningless. Each `AllocateCappedAsync` call acquires and releases its own `SELECT … FOR UPDATE` locks independently, so all Phase 4 invariants hold without modification.
 
 ### EF Core + Dapper together
 
@@ -463,6 +479,65 @@ Returns 409 if a concurrent modification races this request (`version` mismatch)
 | 200 | OK |
 | 404 | Customer not found |
 | 422 | Validation error or duplicate `customerCode` |
+
+---
+
+### Customer Contracts
+
+| Method | Path | Role | Description |
+|---|---|---|---|
+| POST | `/customers/{id}/contracts` | `sales-ops` | Create a new per-SKU contract for a customer |
+| GET | `/customers/{id}/contracts` | any-auth | List all contracts for a customer, most recent first |
+| GET | `/customers/{id}/contracts/utilization` | any-auth | Live utilization snapshot for currently-active contracts |
+
+**POST `/customers/{id}/contracts` body:**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `skuId` | Guid | yes | ID of an existing SKU |
+| `floorQty` | int | yes | Minimum units the allocation run must attempt for this customer and SKU (≥ 0) |
+| `ceilingQty` | int? | no | Maximum total units; null = uncapped |
+| `effectiveFrom` | DateOnly | yes | Inclusive start date |
+| `effectiveTo` | DateOnly? | no | Inclusive end date; null = open-ended |
+
+Returns 404 if the customer or SKU does not exist. Returns 422 if `ceilingQty < floorQty`, `effectiveTo < effectiveFrom`, or the period overlaps an existing contract for the same (customer, SKU) pair.
+
+**`ContractResponse` fields:**
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | Guid | Contract ID |
+| `customerId` | Guid | Customer ID |
+| `skuId` | Guid | SKU ID |
+| `skuCode` | string | SKU code |
+| `floorQty` | int | Contractual minimum per run |
+| `ceilingQty` | int? | Contractual maximum per run; null = uncapped |
+| `effectiveFrom` | DateOnly | Inclusive start date |
+| `effectiveTo` | DateOnly? | Inclusive end date; null = open-ended |
+| `createdAt` | DateTime | UTC creation timestamp |
+
+**GET `/customers/{id}/contracts/utilization` response (`ContractUtilizationResponse` per active contract):**
+
+| Field | Type | Description |
+|---|---|---|
+| `contractId` | Guid | Contract ID |
+| `skuId` | Guid | SKU ID |
+| `skuCode` | string | SKU code |
+| `floorQty` | int | Contractual minimum |
+| `ceilingQty` | int? | Contractual maximum; null = uncapped |
+| `effectiveFrom` | DateOnly | Contract start date |
+| `effectiveTo` | DateOnly? | Contract end date; null = open-ended |
+| `allocatedQty` | int | Total units allocated across all non-cancelled orders for this customer and SKU to date |
+
+**Status codes:**
+
+| Code | Meaning |
+|---|---|
+| 201 | Contract created |
+| 200 | OK (GET) |
+| 403 | `sales-ops` role required (create only) |
+| 404 | Customer or SKU not found |
+| 422 | Validation error or overlapping period |
 
 ---
 
@@ -891,6 +966,23 @@ results                 jsonb?   serialised AllocationRunResult[] per-order outc
 
 Indexes: `status` (worker poll query), `requestedAt DESC` (list endpoint)
 
+### CustomerContract
+
+```
+id             Guid      PK
+customerId     Guid      FK → Customer (restrict)
+skuId          Guid      FK → Sku (restrict)
+floorQty       int       minimum units the allocation run must attempt for this customer and SKU (≥ 0; CHECK)
+ceilingQty     int?      maximum total units; null = uncapped
+effectiveFrom  DateOnly  inclusive start date (stored as timestamp without time zone — Dapper DateOnlyTypeHandler bridges DateTime → DateOnly)
+effectiveTo    DateOnly? inclusive end date; null = open-ended
+createdAt      DateTimeOffset
+```
+
+Index: `idx_customer_contracts_customer_sku` on `(customer_id, sku_id)` — overlap check query.
+
+Overlap constraint is enforced in application code (`ContractService.CreateAsync`): an existing contract for the same `(customerId, skuId)` pair may not overlap the requested `(effectiveFrom, effectiveTo)` range. Open-ended contracts (`effective_to IS NULL`) always overlap any future request for the same pair.
+
 ---
 
 ## Pagination
@@ -950,3 +1042,4 @@ On first startup, 5 representative memory and NAND SKUs are seeded automatically
 | 14 | Idempotency — `idempotency_keys` table with unique index on `idempotency_key`; `IdempotencyMiddleware` claims keys via atomic DB insert; buffers 2xx/4xx responses and replays them on duplicate requests with `X-Idempotency-Replayed: true`; `409 IDEMPOTENCY_IN_FLIGHT` on concurrent in-flight duplicates; `422 IDEMPOTENCY_KEY_MISMATCH` on path reuse; 5xx outcomes not stored (client-retry safe); `IdempotencyCleanupJob` purges expired `complete` records and stuck `processing` records; `IdempotencySettings` (`ExpiryHours`, `CleanupIntervalSeconds`, `StuckProcessingAgeMinutes`); `IdempotencyHeaderOperationFilter` exposes optional header on all qualifying `POST` operations in Swagger UI | Done |
 | 15 | Async allocation run — `POST /allocations/run` returns `202 Accepted` immediately with a `runId` instead of blocking; `allocation_runs` table with `pending → running → completed \| failed` state machine; `AllocationRunWorker` (`BackgroundService`) polls via `SELECT … FOR UPDATE SKIP LOCKED` (multi-replica safe), calls `RunPriorityAllocationAsync`, persists aggregated stats (`ordersProcessed`, `ordersFullyAllocated`, `ordersPartiallyAllocated`) and per-order JSON results; `GET /allocations/runs/{id}` status poll endpoint; `GET /allocations/runs` lists 20 most recent runs newest-first; `409 RUN_IN_PROGRESS` when a run is already active (response body contains in-progress run ID); `AllocationRunHealthCheck` degrades when any run has been `running` > 15 min (stuck worker detection); `IAllocationRunService` with `EnqueueResult` discriminated union (`Accepted` / `Conflict`); 9 integration tests covering 202+poll, state transitions, per-order results, 409 conflict, 202-after-complete, 404 unknown ID, list newest-first, zero-orders run, and fault injection via `WithWebHostBuilder` service override | Done |
 | 16 | Customer entity and order linkage — `customers` table with unique `customer_code` and `tier` (stored as `tier-1`/`tier-2`/`tier-3`); `Customer` entity with private EF constructor; `CustomerTier` enum with `ToDbString`/`FromDbString` extensions; `ICustomerService` + `CustomerService` (EF write, Dapper reads); `CustomersController` (`POST [sales-ops]`, `GET /{id}`, `GET /`); nullable `customer_id` FK on `orders` with RESTRICT and `idx_orders_customer_id` index; `OrderService.CreateAsync` validates `customerId` if present; `OrderService.GetByIdAsync` LEFT JOINs `customers` to populate `customerCode`/`customerName`; `OrderService.ListAsync` accepts optional `customerId` filter; `CreateOrderRequest` / `OrderResponse` / `OrderSummaryResponse` updated with nullable customer fields; 11 integration tests (CRUD, duplicate 422, paginated list, order linkage, backward compat, unknown customerId 422, list filter, summary fields, allocate→cancel cycle) | Done |
+| 17 | Customer contracts + two-pass allocation enforcement — `customer_contracts` table (FK → `customers`, FK → `skus`; per-SKU floor/ceiling allocation guarantees with date ranges); `CustomerContract` entity with `IsActiveOn(date)` helper; overlap guard in `ContractService.CreateAsync` rejects any `(customerId, skuId)` period overlap; `IContractService` / `ContractService` (EF write, Dapper reads); `ContractsController` nested under `/customers/{id}/contracts` (`POST [sales-ops]`, `GET /`, `GET /utilization`); `DateOnlyTypeHandler` Dapper bridge (`timestamp without time zone` → `DateOnly`) registered globally in `Program.cs`; `RunPriorityAllocationAsync` two-pass rewrite: **floor pass** allocates contractual minimums sorted Tier1 → Tier2 → Tier3 then `floorQty` descending, tracking `ceilingSpent[(customerId, skuId)]`; **priority pass** processes all open orders `critical` → `high` → `standard` then `createdAt` with per-SKU `ceilingQty − ceilingSpent` cap for contracted customers (uncontracted orders remain uncapped); `AllocateCappedAsync` private helper accepts optional `skuCapOverrides` dictionary; `ContractRecords.cs` (`CreateContractRequest`, `ContractResponse`, `ContractUtilizationResponse`); `ApiFixture.ResetDatabaseAsync` updated to delete `customer_contracts` before `customers`/`skus` (FK order); `AllocationTestBase.CreateCustomerAsync` tier format corrected from `ToDbString()` to `ToString().ToLowerInvariant()` (API expects `tier1`, not `tier-1`); 16 integration tests (create CRUD + validation, list, utilization, ceiling enforcement across multiple orders, floor guarantee before unconstrained customers) | Done |
