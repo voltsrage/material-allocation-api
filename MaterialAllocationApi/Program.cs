@@ -50,6 +50,7 @@ try
     builder.Services.AddScoped<IRollupService, RollupService>();
     builder.Services.AddScoped<ITokenService, JwtTokenService>();
     builder.Services.AddScoped<IAllocationRunService, AllocationRunService>();
+    builder.Services.AddScoped<ICustomerService, CustomerService>(); 
 
     builder.Services.Configure<OutboxRelaySettings>(
         builder.Configuration.GetSection("OutboxRelay")
@@ -141,6 +142,9 @@ try
                 **Error model:** every non-2xx response returns `ApiResponse<null>` with a machine-readable
                 `error.code` field. Conflict codes: `ORDER_CANCELLED`, `ORDER_FULLY_ALLOCATED`,
                 `ORDER_ALREADY_CANCELLED`, `CONCURRENT_MODIFICATION`. Validation code: `VALIDATION_ERROR`.
+
+                **Customer tiers:** `tier-1` (contracted, Phase 17 enforces floor/ceiling),
+                `tier-2` (partial contract), `spot` (priority-only, no contract).
                 """
         });
 

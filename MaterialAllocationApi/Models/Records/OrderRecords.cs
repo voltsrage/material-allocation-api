@@ -8,7 +8,8 @@ public record CreateOrderLineRequest(
 public record CreateOrderRequest(
     [Required, MaxLength(64)] string ReferenceCode,
     [Required] OrderPriority Priority,
-    [Required, MinLength(1)] IReadOnlyList<CreateOrderLineRequest> Lines
+    [Required, MinLength(1)] IReadOnlyList<CreateOrderLineRequest> Lines,
+    Guid? CustomerId = null
 );
 
 public record OrderLineResponse(
@@ -25,7 +26,10 @@ public record OrderResponse(
     string Priority,
     string Status,
     DateTime CreatedAt,
-    IReadOnlyList<OrderLineResponse> Lines
+    IReadOnlyList<OrderLineResponse> Lines,
+    Guid? CustomerId = null,
+    string? CustomerCode = null,
+    string? CustomerName = null
 );
 
 public record OrderSummaryResponse(
@@ -34,5 +38,7 @@ public record OrderSummaryResponse(
     string Priority,
     string Status,
     long LineCount,
-    DateTime CreatedAt
+    DateTime CreatedAt,
+    Guid? CustomerId = null,
+    string? CustomerCode = null
 );

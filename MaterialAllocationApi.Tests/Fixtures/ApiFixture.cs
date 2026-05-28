@@ -83,6 +83,7 @@ public class ApiFixture : WebApplicationFactory<Program>, IAsyncLifetime
         // order_lines deletion cascades to reservations.
         await db.Database.ExecuteSqlRawAsync("DELETE FROM order_lines");
         await db.Database.ExecuteSqlRawAsync("DELETE FROM orders");
+        await db.Database.ExecuteSqlRawAsync("DELETE FROM customers");
         await db.Database.ExecuteSqlRawAsync("DELETE FROM skus");
     }
 

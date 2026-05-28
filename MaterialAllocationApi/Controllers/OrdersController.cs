@@ -53,12 +53,13 @@ public class OrdersController : ControllerBase
     [ProducesResponseType(typeof(ApiResponse<PagedResult<OrderSummaryResponse>>), StatusCodes.Status200OK)]
     public async Task<ActionResult<ApiResponse<PagedResult<OrderSummaryResponse>>>> List(
         [FromQuery] string? status,
+        [FromQuery] Guid? customerId, 
         [FromQuery] int page = 1,
         [FromQuery] int pageSize = 20,
         CancellationToken ct = default
     )
     {
-        var result = await _orders.ListAsync(status, page, pageSize, ct);
+        var result = await _orders.ListAsync(status, customerId, page, pageSize, ct);
 
         return Ok(ApiResponse<PagedResult<OrderSummaryResponse>>.Ok(result));
     }

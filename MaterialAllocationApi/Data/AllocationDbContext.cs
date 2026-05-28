@@ -14,6 +14,7 @@ public class AllocationDbContext : DbContext
     public DbSet<OutboxMessage> OutboxMessages => Set<OutboxMessage>();
     public DbSet<IdempotencyRecord> IdempotencyRecords => Set<IdempotencyRecord>();
     public DbSet<AllocationRun> AllocationRuns => Set<AllocationRun>();
+    public DbSet<Customer> Customers => Set<Customer>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -69,12 +70,21 @@ public class AllocationDbContext : DbContext
                 .HasConversion(
                     v => v.ToDbString(),
                     v => OrderStatusExtensions.FromDbString(v));
+            b.Property(x => x.CustomerId).HasColumnName("customer_id");
             b.Property(x => x.CreatedAt).HasColumnName("created_at").IsRequired();
+
+            b.HasOne(x => x.Customer)
+                .WithMany()
+                .HasForeignKey(x => x.CustomerId)
+                .OnDelete(DeleteBehavior.Restrict)
+                .IsRequired(false);
 
             // Uniqueness: reference_code is the caller-assigned natural key
             b.HasIndex(x => x.ReferenceCode).IsUnique().HasDatabaseName("idx_orders_reference_code");
             // Filter: list endpoint filters by status without scanning every order row
             b.HasIndex(x => x.Status).HasDatabaseName("idx_orders_status");
+            // Filter: list endpoint will support filtering by customer without scanning all orders.
+            b.HasIndex(x => x.CustomerId).HasDatabaseName("idx_orders_customer_id");
         });
 
         modelBuilder.Entity<OrderLine>(b =>
@@ -226,6 +236,22 @@ public class AllocationDbContext : DbContext
             // Worker query: SELECT pending runs ordered by submission time.
             b.HasIndex(x => new { x.Status, x.RequestedAt })
                 .HasDatabaseName("idx_allocation_runs_status_requested_at");
+        });
+
+        modelBuilder.Entity<Customer>(b =>
+        {
+            b.ToTable("customers");
+            b.HasKey(x => x.Id);
+            b.Property(x => x.Id).HasColumnName("id").HasDefaultValueSql("gen_random_uuid()");
+            b.Property(x => x.CustomerCode).HasColumnName("customer_code").HasMaxLength(64).IsRequired();
+            b.Property(x => x.Name).HasColumnName("name").HasMaxLength(256).IsRequired();
+            b.Property(x => x.Tier).HasColumnName("tier").HasMaxLength(32).IsRequired()
+                .HasConversion(
+                    v => v.ToDbString(),
+                    v => CustomerTierExtensions.FromDbString(v));
+            b.Property(x => x.CreatedAt).HasColumnName("created_at").IsRequired();
+
+            b.HasIndex(x => x.CustomerCode).IsUnique().HasDatabaseName("idx_customers_code");
         });
     }
 }

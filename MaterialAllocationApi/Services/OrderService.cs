@@ -185,8 +185,17 @@ public class OrderService : IOrderService
                 $"Unknown SKU IDs: {string.Join(", ", missingSkuIds)}"
             );
 
+        if (request.CustomerId.HasValue)
+        {
+            var customerExists = await _db.Customers
+                .AnyAsync(c => c.Id == request.CustomerId.Value,ct);
+            
+            if(!customerExists)
+                throw new ValidationException($"Customer {request.CustomerId.Value} not found.");
+        }
+
         // 3. Build the aggregate
-        var order = new Order(request.ReferenceCode, request.Priority);
+        var order = new Order(request.ReferenceCode, request.Priority, request.CustomerId);
 
         foreach(var line in request.Lines)
         {
@@ -220,8 +229,8 @@ public class OrderService : IOrderService
         }
 
         _logger.LogInformation(
-            "Order {OrderId} created: referenceCode={ReferenceCode}, lines={LineCount}.",
-            order.Id, order.ReferenceCode, order.Lines.Count);
+            "Order {OrderId} created: referenceCode={ReferenceCode}, customerId={CustomerId}, lines={LineCount}.",
+            order.Id, order.ReferenceCode, order.CustomerId, order.Lines.Count);
 
         // 4. Return the full response via Dapper so SkuCode is populated in order lines.
         return await GetByIdAsync(order.Id,ct);
@@ -233,13 +242,17 @@ public class OrderService : IOrderService
 
         const string sql = @"
             SELECT
-                id AS Id,
-                reference_code AS ReferenceCode,
-                priority AS Priority,
-                status AS Status,
-                created_at AS CreatedAt
-            FROM orders
-            WHERE id = @Id;
+                o.id AS Id,
+                o.reference_code AS ReferenceCode,
+                o.priority AS Priority,
+                o.status AS Status,
+                o.created_at AS CreatedAt,
+                o.customer_id AS CustomerId,
+                c.customer_code as CustomerCode,
+                c.name as CustomerName
+            FROM orders o
+            LEFT JOIN customers c ON c.id = o.customer_id
+            WHERE o.id = @Id;
 
             SELECT
                 ol.id as Id,
@@ -255,17 +268,21 @@ public class OrderService : IOrderService
 
         using var multi = await connection.QueryMultipleAsync(sql, new {Id = id});
 
-        var order = await multi.ReadFirstOrDefaultAsync<(Guid Id, string ReferenceCode, string Priority, string Status, DateTimeOffset CreatedAt)>();
+        var order = await multi.ReadFirstOrDefaultAsync<
+        (Guid Id, string ReferenceCode, string Priority, string Status, DateTimeOffset CreatedAt,
+         Guid? CustomerId, string? CustomerCode, string? CustomerName)>();
 
         if(order == default)
             throw new NotFoundException($"Order {id} not found.");
 
         var lines = (await multi.ReadAsync<OrderLineResponse>()).AsList();
 
-        return new OrderResponse(order.Id, order.ReferenceCode, order.Priority, order.Status, order.CreatedAt.UtcDateTime, lines);
+        return new OrderResponse(
+            order.Id, order.ReferenceCode, order.Priority, order.Status, order.CreatedAt.UtcDateTime, lines,
+            order.CustomerId, order.CustomerCode, order.CustomerName);
     }
 
-    public async Task<PagedResult<OrderSummaryResponse>> ListAsync(string? status, int page, int pageSize, CancellationToken ct = default)
+    public async Task<PagedResult<OrderSummaryResponse>> ListAsync(string? status, Guid? customerId, int page, int pageSize, CancellationToken ct = default)
     {
         pageSize = Math.Min(pageSize, 100);
         page = Math.Max(page, 1);
@@ -285,6 +302,12 @@ public class OrderService : IOrderService
             parameters.Add("Status", status);
         }
 
+        if (customerId.HasValue)
+        {
+            conditions.Add("o.customer_id = @CustomerId");
+            parameters.Add("CustomerId", customerId);
+        }
+
         var where = conditions.Count > 0 ? $"WHERE {string.Join(" AND ", conditions)}" : string.Empty;
 
         var countSql = $"SELECT COUNT(*) FROM orders o {where}";
@@ -296,11 +319,14 @@ public class OrderService : IOrderService
                 o.priority as Priority,
                 o.status AS Status,
                 COUNT(ol.id) as LineCount,
-                o.created_at as CreatedAt
+                o.created_at as CreatedAt,
+                o.customer_id    AS CustomerId,
+                c.customer_code  AS CustomerCode
             FROM orders o
             LEFT JOIN order_lines ol on ol.order_id = o.id
+            LEFT JOIN customers c on c.id = o.customer_id
             {where}
-            GROUP BY o.id, o.reference_code, o.priority, o.status, o.created_at
+            GROUP BY o.id, o.reference_code, o.priority, o.status, o.created_at, o.customer_id, c.customer_code
             ORDER BY o.created_at DESC, o.id
             LIMIT @PageSize OFFSET @Offset
         ";

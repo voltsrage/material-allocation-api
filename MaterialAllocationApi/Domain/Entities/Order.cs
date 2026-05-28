@@ -4,17 +4,21 @@ public class Order
     public string ReferenceCode { get; private set; } = string.Empty;
     public OrderPriority Priority { get; private set; }
     public OrderStatus Status { get; private set; }
+    public Guid? CustomerId { get; private set; }
     public DateTimeOffset CreatedAt { get; private set; }
+
+    public Customer? Customer { get; private set; }
 
     public ICollection<OrderLine> Lines { get; private set; } = new List<OrderLine>();
 
     private Order() {}
 
-    public Order(string referenceCode, OrderPriority priority)
+    public Order(string referenceCode, OrderPriority priority, Guid? customerId)
     {
         ReferenceCode = referenceCode;
         Priority = priority;
         Status = OrderStatus.Open;
+        CustomerId = customerId;
         CreatedAt = DateTimeOffset.UtcNow;
     }
 
