@@ -19,6 +19,49 @@ public class LotService : ILotService
         _logger = logger;
     }
 
+    public async Task<PagedResult<LotAllocationHistoryEntry>> GetAllocationsAsync(Guid lotId, int page, int pageSize, CancellationToken ct = default)
+    {
+        _ = await _db.Lots.FindAsync([lotId], ct)
+        ?? throw new NotFoundException($"Lot {lotId} not found.");
+
+        pageSize = Math.Min(pageSize, 100);
+        page     = Math.Max(page, 1);
+        var offset = (page - 1) * pageSize;
+
+        using var conn = await _connectionFactory.CreateAsync(ct);
+
+        var total = await conn.ExecuteScalarAsync<int>(
+            @"
+            SELECT COUNT(*)
+            FROM allocation_events
+            WHERE lot_id = @lotId AND event_type = 'allocation_committed'
+            ",
+            new {lotId}
+        );
+
+        var items = (await conn.QueryAsync<LotAllocationHistoryEntry>(
+            @"
+            SELECT
+                o.id as OrderId,
+                o.reference_code as ReferenceCode,
+                o.priority AS Priority,
+                o.status AS OrderStatus,
+                ae.order_line_id AS OrderLineId,
+                ae.quantity as QuantityConsumed,
+                ae.occurred_at AS OccurredAt
+            FROM allocation_events ae
+            JOIN orders o on o.id = ae.order_id
+            WHERE ae.lot_id = @lotId
+                AND ae.event_type = 'allocation_committed'
+            ORDER BY ae.occurred_at DESC
+            LIMIT @pageSize OFFSET @offset
+            ",
+            new {lotId, pageSize, offset}
+        )).AsList();
+
+        return new PagedResult<LotAllocationHistoryEntry>(items, page, pageSize, total);
+    }
+
     public async Task<LotResponse> GetByIdAsync(Guid id, CancellationToken ct = default)
     {
         using var conn = await _connectionFactory.CreateAsync(ct);
@@ -43,6 +86,114 @@ public class LotService : ILotService
         );
 
         return row ?? throw new NotFoundException($"Lot {id} not found.");
+    }
+
+    public async Task<IReadOnlyList<LotEventHistoryEntry>> GetEventsAsync(Guid lotId, CancellationToken ct = default)
+    {
+        _ = await _db.Lots.FindAsync([lotId], ct)
+            ?? throw new NotFoundException($"Lot {lotId} not found.");
+
+        using var conn = await _connectionFactory.CreateAsync(ct);
+
+        var rows = await conn.QueryAsync<LotEventHistoryEntry>(
+            @"
+            SELECT
+                event_type as EventType,
+                quantity_affected as QuantityAffected,
+                notes as Notes,
+                occurred_at AS OccurredAt
+            FROM lot_events
+            WHERE lot_id = @lotId
+            ORDER BY occurred_at
+            ",
+            new {lotId}
+        );
+
+        return rows.AsList();
+    }
+
+    public async Task<IReadOnlyList<OrderLotProvenanceEntry>> GetOrderLotsAsync(Guid orderId, CancellationToken ct)
+    {
+        _ = await _db.Orders.FirstOrDefaultAsync(o => o.Id == orderId, ct)
+            ?? throw new NotFoundException($"Order {orderId} not found.");
+        
+        using var conn = await _connectionFactory.CreateAsync(ct);
+
+        var rows = await conn.QueryAsync<OrderLotProvenanceEntry>(
+            @"
+            SELECT
+                l.id AS LotId,
+                l.lot_code AS LotCode,
+                l.sku_id as SkuId,
+                s.sku_code as SkuCode,
+                SUM(ae.quantity)::INT AS QuantityConsumed,
+                l.status as LotStatus,
+                l.received_at as ReceivedAt
+            FROM allocation_events ae
+            JOIN lots l ON l.id = ae.lot_id
+            JOIN skus s on s.id = l.sku_id
+            WHERE ae.order_id = @orderId
+                AND ae.event_type = 'allocation_committed'
+                AND ae.lot_id IS NOT NULL
+            GROUP BY l.id, s.sku_code
+            ORDER BY s.sku_code, l.received_at
+            ",
+            new {orderId}
+        );
+
+        return rows.AsList();
+    }
+
+    public async Task<SkuLotSnapshotResponse> GetSkuSnapshotAsync(Guid skuId, CancellationToken ct)
+    {
+        using var conn = await _connectionFactory.CreateAsync(ct);
+
+        // Three queries in on round trip via QueryMultipleAsync
+        using var multi = await conn.QueryMultipleAsync(
+            @"
+            SELECT 
+                id as SkuId,
+                sku_code as SkuCode,
+                on_hand AS OnHand
+            FROM skus
+            WHERE id = @skuId;
+
+            SELECT
+                status as Status,
+                COUNT(*)::INT as LotCount,
+                COALESCE(SUM(available_qty), 0)::INT as TotalAvailableQty
+            FROM lots
+            WHERE sku_id = @skUId
+            GROUP by status
+            ORDER BY status;
+
+            SELECT
+                id as LotId,
+                lot_code as LotCode,
+                quantity as Quantity,
+                available_qty AS AvailableQty,
+                status as Status,
+                received_at as Received_at
+            FROM lots
+            WHERE sku_id = @skuId
+            ORDER BY received_at DESC, lot_code
+            ",
+            new {skuId}
+        );
+
+        var skuRow = await multi.ReadFirstOrDefaultAsync<(Guid SkuId, string SkuCode, int OnHand)>();
+
+        if(skuRow == default)
+            throw new NotFoundException($"SKU {skuId} not found.");
+
+        var summary = (await multi.ReadAsync<LotStatusSummary>()).AsList();
+        var lots = (await multi.ReadAsync<LotSnapshotEntry>()).AsList();
+
+        return new SkuLotSnapshotResponse(
+            skuRow.SkuId, skuRow.SkuCode, skuRow.OnHand,
+            summary.AsReadOnly(),
+            lots.AsReadOnly()
+        );
     }
 
     public async Task<PagedResult<LotResponse>> ListBySkuAsync(Guid skuId, string? status, int page, int pageSize, CancellationToken ct = default)

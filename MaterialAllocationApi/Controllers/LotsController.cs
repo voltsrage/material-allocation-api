@@ -128,4 +128,73 @@ public class LotsController : ControllerBase
 
         return Ok(ApiResponse<LotResponse>.Ok(lot));
     }
+
+    /// <summary>
+    /// Paginated history of allocation events that consumed from this lot.
+    /// Each entry is one allocation_committed event — an order that was allocated
+    /// in multiple runs may appear multiple times.
+    /// Returns empty results (not 404) when the lot exists but has never been allocated against.
+    /// </summary>
+    /// <response code="200">Allocation history (may be empty).</response>
+    /// <response code="404">Lot not found.</response>
+    [HttpGet("lots/{id:guid}/allocations")]
+    [ProducesResponseType(typeof(ApiResponse<PagedResult<LotAllocationHistoryEntry>>), 200)]
+    [ProducesResponseType(typeof(ApiResponse<object>), 404)]
+    public async Task<ActionResult<ApiResponse<PagedResult<LotAllocationHistoryEntry>>>> GetAllocations(
+        Guid id,
+        [FromQuery] int page = 1,
+        [FromQuery] int pageSize = 20,
+        CancellationToken ct = default)
+    {
+        var result = await _lots.GetAllocationsAsync(id, page, pageSize, ct);
+        return Ok(ApiResponse<PagedResult<LotAllocationHistoryEntry>>.Ok(result));
+    }
+
+    /// <summary>
+    /// Full lifecycle event history for a lot — quarantine, release, and scrap events in
+    /// chronological order. Each entry corresponds to one row in lot_events.
+    /// </summary>
+    /// <response code="200">Event list (empty if the lot has had no status transitions).</response>
+    /// <response code="404">Lot not found.</response>
+    [HttpGet("lots/{id:guid}/events")]
+    [ProducesResponseType(typeof(ApiResponse<IReadOnlyList<LotEventHistoryEntry>>), 200)]
+    [ProducesResponseType(typeof(ApiResponse<object>), 404)]
+    public async Task<ActionResult<ApiResponse<IReadOnlyList<LotEventHistoryEntry>>>> GetEvents(Guid id, CancellationToken ct)
+    {
+        var result = await _lots.GetEventsAsync(id, ct);
+        return Ok(ApiResponse<IReadOnlyList<LotEventHistoryEntry>>.Ok(result));
+    }
+
+    /// <summary>
+    /// Lots that were consumed to fill an order, with quantities and current lot status.
+    /// Returns empty results (not 404) when the order exists but was filled from non-lot
+    /// inventory (the on-hand fallthrough path).
+    /// </summary>
+    /// <response code="200">Lot provenance list (may be empty).</response>
+    /// <response code="404">Order not found.</response>
+    [HttpGet("orders/{orderId:guid}/lots")]
+    [ProducesResponseType(typeof(ApiResponse<IReadOnlyList<OrderLotProvenanceEntry>>), 200)]
+    [ProducesResponseType(typeof(ApiResponse<object>), 404)]
+    public async Task<ActionResult<ApiResponse<IReadOnlyList<OrderLotProvenanceEntry>>>> GetOrderLots(Guid orderId, CancellationToken ct)
+    {
+        var result = await _lots.GetOrderLotsAsync(orderId, ct);
+        return Ok(ApiResponse<IReadOnlyList<OrderLotProvenanceEntry>>.Ok(result));
+    }
+
+    /// <summary>
+    /// Live lot inventory snapshot for a SKU. Returns per-status aggregate counts
+    /// and the full individual lot list, newest received first.
+    /// The on_hand field reflects the SKU's maintained aggregate (sum of available lot quantities
+    /// plus any pre-lot inventory added via adjust).
+    /// </summary>
+    /// <response code="200">Snapshot retrieved.</response>
+    /// <response code="404">SKU not found.</response>
+    [HttpGet("skus/{skuId:guid}/lots/snapshot")]
+    [ProducesResponseType(typeof(ApiResponse<SkuLotSnapshotResponse>), 200)]
+    [ProducesResponseType(typeof(ApiResponse<object>), 404)]
+    public async Task<ActionResult<ApiResponse<SkuLotSnapshotResponse>>> GetSkuSnapshot(Guid skuId, CancellationToken ct)
+    {
+        var result = await _lots.GetSkuSnapshotAsync(skuId, ct);
+        return Ok(ApiResponse<SkuLotSnapshotResponse>.Ok(result));
+    }
 }

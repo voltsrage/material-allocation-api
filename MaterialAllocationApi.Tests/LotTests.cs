@@ -416,6 +416,305 @@ public class LotTests(ApiFixture fixture) : AllocationTestBase(fixture)
         Assert.Equal(0, await GetOnHandAsync(skuId));
     }
 
+    // ── 9a — Lot allocation history ───────────────────────────────────────────
+
+    [Fact]
+    public async Task LotAllocations_ReturnsEntryForEachAllocationEvent()
+    {
+        var skuId = await CreateSkuAsync("LHIST-A1-SKU", onHand: 0);
+        var lotA  = await CreateLotAsync(skuId, "LHIST-A1-LOT", 100);
+
+        var orderXId = await CreateOrderAsync("LHIST-A1-ORD-X", skuId, requestedQty: 40);
+        var orderYId = await CreateOrderAsync("LHIST-A1-ORD-Y", skuId, requestedQty: 30);
+        await AllocateAsync(orderXId);
+        await AllocateAsync(orderYId);
+
+        var response = await Client.GetAsync($"/api/v1/lots/{lotA.Id}/allocations");
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        var result = await ReadAsync<PagedResult<LotAllocationHistoryEntry>>(response);
+        Assert.Equal(2, result.TotalCount);
+        Assert.Equal(2, result.Items.Count);
+
+        var forX = result.Items.Single(e => e.OrderId == orderXId);
+        Assert.Equal(40, forX.QuantityConsumed);
+
+        var forY = result.Items.Single(e => e.OrderId == orderYId);
+        Assert.Equal(30, forY.QuantityConsumed);
+
+        Assert.True(result.Items[0].OccurredAt >= result.Items[1].OccurredAt);
+    }
+
+    [Fact]
+    public async Task LotAllocations_EmptyWhenLotNeverAllocatedAgainst()
+    {
+        var skuId = await CreateSkuAsync("LHIST-A2-SKU", onHand: 0);
+        var lot   = await CreateLotAsync(skuId, "LHIST-A2-LOT", 50);
+
+        var response = await Client.GetAsync($"/api/v1/lots/{lot.Id}/allocations");
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        var result = await ReadAsync<PagedResult<LotAllocationHistoryEntry>>(response);
+        Assert.Equal(0, result.TotalCount);
+        Assert.Empty(result.Items);
+    }
+
+    [Fact]
+    public async Task LotAllocations_IsPaginated()
+    {
+        var skuId = await CreateSkuAsync("LHIST-A3-SKU", onHand: 0);
+        var lot   = await CreateLotAsync(skuId, "LHIST-A3-LOT", 500);
+
+        for (var i = 1; i <= 5; i++)
+        {
+            var orderId = await CreateOrderAsync($"LHIST-A3-ORD-{i:D2}", skuId, requestedQty: 10);
+            await AllocateAsync(orderId);
+        }
+
+        var response = await Client.GetAsync($"/api/v1/lots/{lot.Id}/allocations?pageSize=2&page=1");
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        var result = await ReadAsync<PagedResult<LotAllocationHistoryEntry>>(response);
+        Assert.Equal(5, result.TotalCount);
+        Assert.Equal(2, result.Items.Count);
+    }
+
+    [Fact]
+    public async Task LotAllocations_UnknownLot_Returns404()
+    {
+        var response = await Client.GetAsync($"/api/v1/lots/{Guid.NewGuid()}/allocations");
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+    }
+
+    // ── 9b — Lot event history ────────────────────────────────────────────────
+
+    [Fact]
+    public async Task LotEvents_ShowsQuarantineAndReleaseChronologically()
+    {
+        var skuId = await CreateSkuAsync("LEVT-B1-SKU", onHand: 0);
+        var lot   = await CreateLotAsync(skuId, "LEVT-B1-LOT", 80);
+        await QuarantineLotAsync(lot.Id, "Hold for particle check");
+        await ReleaseLotAsync(lot.Id, "Cleared by QA");
+
+        var response = await Client.GetAsync($"/api/v1/lots/{lot.Id}/events");
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        var events = await ReadAsync<IReadOnlyList<LotEventHistoryEntry>>(response);
+        Assert.Equal(2, events.Count);
+        Assert.Equal("quarantined", events[0].EventType);
+        Assert.Equal("released",    events[1].EventType);
+        Assert.True(events[0].OccurredAt <= events[1].OccurredAt);
+        Assert.Equal("Hold for particle check", events[0].Notes);
+        Assert.Equal(80, events[0].QuantityAffected);
+    }
+
+    [Fact]
+    public async Task LotEvents_EmptyForFreshLot()
+    {
+        var skuId = await CreateSkuAsync("LEVT-B2-SKU", onHand: 0);
+        var lot   = await CreateLotAsync(skuId, "LEVT-B2-LOT", 40);
+
+        var response = await Client.GetAsync($"/api/v1/lots/{lot.Id}/events");
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        var events = await ReadAsync<IReadOnlyList<LotEventHistoryEntry>>(response);
+        Assert.Empty(events);
+    }
+
+    [Fact]
+    public async Task LotEvents_ScrapEventAppearsInHistory()
+    {
+        var skuId = await CreateSkuAsync("LEVT-B3-SKU", onHand: 0);
+        var lot   = await CreateLotAsync(skuId, "LEVT-B3-LOT", 25);
+        await ScrapLotAsync(lot.Id);
+
+        var response = await Client.GetAsync($"/api/v1/lots/{lot.Id}/events");
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        var events = await ReadAsync<IReadOnlyList<LotEventHistoryEntry>>(response);
+        Assert.Single(events);
+        Assert.Equal("scrapped", events[0].EventType);
+    }
+
+    [Fact]
+    public async Task LotEvents_UnknownLot_Returns404()
+    {
+        var response = await Client.GetAsync($"/api/v1/lots/{Guid.NewGuid()}/events");
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+    }
+
+    // ── 9c — Order lot provenance ─────────────────────────────────────────────
+
+    [Fact]
+    public async Task OrderLots_ShowsAllLotsConsumedAcrossOrder()
+    {
+        var skuId = await CreateSkuAsync("OPROV-C1-SKU", onHand: 0);
+        var t     = DateTimeOffset.UtcNow.AddMinutes(-5);
+        var lotA  = await CreateLotAsync(skuId, "OPROV-C1-LOT-A", 50, receivedAt: t);
+        var lotB  = await CreateLotAsync(skuId, "OPROV-C1-LOT-B", 80, receivedAt: t.AddMinutes(1));
+
+        var orderId = await CreateOrderAsync("OPROV-C1-ORD", skuId, requestedQty: 70);
+        await AllocateAsync(orderId);
+
+        var response = await Client.GetAsync($"/api/v1/orders/{orderId}/lots");
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        var provenance = await ReadAsync<IReadOnlyList<OrderLotProvenanceEntry>>(response);
+        Assert.Equal(2, provenance.Count);
+
+        var entryA = provenance.Single(e => e.LotId == lotA.Id);
+        Assert.Equal(50, entryA.QuantityConsumed);
+
+        var entryB = provenance.Single(e => e.LotId == lotB.Id);
+        Assert.Equal(20, entryB.QuantityConsumed);
+
+        Assert.True(provenance[0].ReceivedAt <= provenance[1].ReceivedAt);
+    }
+
+    [Fact]
+    public async Task OrderLots_EmptyForFallthroughOrder()
+    {
+        var skuId   = await CreateSkuAsync("OPROV-C2-SKU", onHand: 50);
+        var orderId = await CreateOrderAsync("OPROV-C2-ORD", skuId, requestedQty: 30);
+        await AllocateAsync(orderId);
+
+        var response = await Client.GetAsync($"/api/v1/orders/{orderId}/lots");
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        var provenance = await ReadAsync<IReadOnlyList<OrderLotProvenanceEntry>>(response);
+        Assert.Empty(provenance);
+    }
+
+    [Fact]
+    public async Task OrderLots_AggregatesQuantityForSameLot()
+    {
+        var skuId   = await CreateSkuAsync("OPROV-C3-SKU", onHand: 0);
+        var lot     = await CreateLotAsync(skuId, "OPROV-C3-LOT", 60);
+        var orderId = await CreateOrderAsync("OPROV-C3-ORD", skuId, requestedQty: 60);
+        await AllocateAsync(orderId);
+
+        var response = await Client.GetAsync($"/api/v1/orders/{orderId}/lots");
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        var provenance = await ReadAsync<IReadOnlyList<OrderLotProvenanceEntry>>(response);
+        Assert.Single(provenance);
+        Assert.Equal(lot.Id, provenance[0].LotId);
+        Assert.Equal(60, provenance[0].QuantityConsumed);
+    }
+
+    [Fact]
+    public async Task OrderLots_UnknownOrder_Returns404()
+    {
+        var response = await Client.GetAsync($"/api/v1/orders/{Guid.NewGuid()}/lots");
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task OrderLots_ReflectsCurrentLotStatus()
+    {
+        var skuId   = await CreateSkuAsync("OPROV-C5-SKU", onHand: 0);
+        var lot     = await CreateLotAsync(skuId, "OPROV-C5-LOT", 80);
+        var orderId = await CreateOrderAsync("OPROV-C5-ORD", skuId, requestedQty: 30);
+        await AllocateAsync(orderId);
+        await QuarantineLotAsync(lot.Id);
+
+        var response = await Client.GetAsync($"/api/v1/orders/{orderId}/lots");
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        var provenance = await ReadAsync<IReadOnlyList<OrderLotProvenanceEntry>>(response);
+        Assert.Single(provenance);
+        Assert.Equal("quarantined", provenance[0].LotStatus);
+    }
+
+    // ── 9d — SKU lot snapshot ─────────────────────────────────────────────────
+
+    [Fact]
+    public async Task SkuLotSnapshot_ReturnsCorrectAggregateSummary()
+    {
+        var skuId = await CreateSkuAsync("SNAP-D1-SKU", onHand: 0);
+        var t     = DateTimeOffset.UtcNow.AddHours(-1);
+        await CreateLotAsync(skuId, "SNAP-D1-LOT-A", 100, receivedAt: t);
+        var lotB = await CreateLotAsync(skuId, "SNAP-D1-LOT-B", 80, receivedAt: t.AddMinutes(1));
+        await CreateLotAsync(skuId, "SNAP-D1-LOT-C", 50, receivedAt: t.AddMinutes(2));
+        await QuarantineLotAsync(lotB.Id);
+
+        var response = await Client.GetAsync($"/api/v1/skus/{skuId}/lots/snapshot");
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        var snapshot = await ReadAsync<SkuLotSnapshotResponse>(response);
+        Assert.Equal(150, snapshot.OnHand);
+        Assert.Equal(2, snapshot.Summary.Count);
+
+        var availSummary = snapshot.Summary.Single(s => s.Status == "available");
+        Assert.Equal(2,   availSummary.LotCount);
+        Assert.Equal(150, availSummary.TotalAvailableQty);
+
+        var quarSummary = snapshot.Summary.Single(s => s.Status == "quarantined");
+        Assert.Equal(1,  quarSummary.LotCount);
+        Assert.Equal(80, quarSummary.TotalAvailableQty);
+    }
+
+    [Fact]
+    public async Task SkuLotSnapshot_LotsOrderedByReceivedAtDescending()
+    {
+        var skuId = await CreateSkuAsync("SNAP-D2-SKU", onHand: 0);
+        var t     = DateTimeOffset.UtcNow.AddHours(-2);
+        await CreateLotAsync(skuId, "SNAP-D2-LOT-OLD", 10, receivedAt: t);
+        await CreateLotAsync(skuId, "SNAP-D2-LOT-MID", 20, receivedAt: t.AddHours(1));
+        await CreateLotAsync(skuId, "SNAP-D2-LOT-NEW", 30, receivedAt: t.AddHours(2));
+
+        var response = await Client.GetAsync($"/api/v1/skus/{skuId}/lots/snapshot");
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        var snapshot = await ReadAsync<SkuLotSnapshotResponse>(response);
+        Assert.Equal(3, snapshot.Lots.Count);
+        Assert.Equal("SNAP-D2-LOT-NEW", snapshot.Lots[0].LotCode);
+        Assert.Equal("SNAP-D2-LOT-MID", snapshot.Lots[1].LotCode);
+        Assert.Equal("SNAP-D2-LOT-OLD", snapshot.Lots[2].LotCode);
+    }
+
+    [Fact]
+    public async Task SkuLotSnapshot_IncludesDepletedLots()
+    {
+        var skuId   = await CreateSkuAsync("SNAP-D3-SKU", onHand: 0);
+        var lot     = await CreateLotAsync(skuId, "SNAP-D3-LOT", 40);
+        var orderId = await CreateOrderAsync("SNAP-D3-ORD", skuId, requestedQty: 40);
+        await AllocateAsync(orderId);
+
+        var response = await Client.GetAsync($"/api/v1/skus/{skuId}/lots/snapshot");
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        var snapshot = await ReadAsync<SkuLotSnapshotResponse>(response);
+
+        var depletedSummary = snapshot.Summary.Single(s => s.Status == "depleted");
+        Assert.Equal(1, depletedSummary.LotCount);
+        Assert.Equal(0, depletedSummary.TotalAvailableQty);
+
+        var lotEntry = snapshot.Lots.Single(l => l.LotId == lot.Id);
+        Assert.Equal(0, lotEntry.AvailableQty);
+    }
+
+    [Fact]
+    public async Task SkuLotSnapshot_NoLotsReturnsEmptySummaryAndLots()
+    {
+        var skuId = await CreateSkuAsync("SNAP-D4-SKU", onHand: 100);
+
+        var response = await Client.GetAsync($"/api/v1/skus/{skuId}/lots/snapshot");
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        var snapshot = await ReadAsync<SkuLotSnapshotResponse>(response);
+        Assert.Equal(100, snapshot.OnHand);
+        Assert.Empty(snapshot.Summary);
+        Assert.Empty(snapshot.Lots);
+    }
+
+    [Fact]
+    public async Task SkuLotSnapshot_UnknownSku_Returns404()
+    {
+        var response = await Client.GetAsync($"/api/v1/skus/{Guid.NewGuid()}/lots/snapshot");
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     private async Task<LotResponse> ReceiveLotAsync(

@@ -57,6 +57,7 @@ Every time units move — committed, released, or soft-held — an `AllocationEv
 - **Lot-Level Inventory Intake** — `POST /skus/{skuId}/lots` receives a physical lot (`lotCode`, `quantity`, optional `receivedAt`); atomically inserts the `Lot` row, increments `sku.on_hand`, and appends a `lot.received` outbox message in a single transaction; duplicate `lotCode` returns 422; `GET /skus/{skuId}/lots` returns a paginated list ordered by `receivedAt` descending with optional `status` filter; `GET /lots/{id}` returns a single lot by ID; `warehouse-ops` role required for intake; read endpoints require only authentication
 - **Lot Status Lifecycle** — `POST /lots/{id}/quarantine` transitions a lot from `available` to `quarantined` and atomically decrements `sku.on_hand` by `lot.available_qty` (units removed from the allocatable pool without zeroing `available_qty`, so a subsequent release restores the exact held quantity); `POST /lots/{id}/release` reverses a quarantine, restoring `sku.on_hand`; `POST /lots/{id}/scrap` permanently writes off a lot — if scrapping from `available`, `sku.on_hand` is decremented and `available_qty` zeroed; if scrapping from `quarantined`, `on_hand` is unchanged (already deducted at quarantine time); every transition writes a `LotEvent` audit row (`event_type`, `quantity_affected`, `notes`) and an outbox message inside the same transaction; `409` is returned for invalid status transitions (e.g. quarantining an already-quarantined lot); concurrent quarantine requests for the same lot serialize correctly via `SELECT … FOR UPDATE` on both the SKU and lot rows (the pre-flight existence check uses `AnyAsync` rather than `FindAsync` to keep the lot out of EF's identity map, ensuring the `FOR UPDATE` lock inside the transaction always materialises the current DB state)
 - **Lot-Aware Allocation** — `AllocateAsync` selects Available lots in FIFO order (`received_at` ascending, locked `FOR UPDATE` in `id` ascending order after SKU locks are held to prevent deadlocks); for each order line it walks lots oldest-first and calls `lot.Consume(qty)` until the line is satisfied or lots are exhausted; a lot whose `available_qty` reaches zero transitions to `Depleted`; each lot consumed produces a separate `AllocationEvent` carrying `lot_id` so the full lot-to-order chain is traceable; SKUs with no Available lots fall through to the pre-Phase-18 `on_hand` path — all existing tests are unaffected; `AllocationLineResult` gains a nullable `LotAllocations` list (`LotAllocationDetail(LotId, LotCode, QuantityConsumed)` per lot) which is `null` for the fallthrough path; `CancelAsync` reads the `allocation_committed` events for the order, locks the consumed lot rows `FOR UPDATE` in `id` ascending order, and calls `lot.Restore(qty)` on each — a `Depleted` lot is transitioned back to `Available`; `Quarantined` or `Scrapped` lots are never restored by a business cancellation
+- **Lot Traceability Queries** — four read-only Dapper endpoints that close the traceability loop built across Phases 18–20: `GET /lots/{id}/allocations` returns a paginated history of every `allocation_committed` event for a lot (which orders consumed it, how many units each, ordered `occurredAt` descending); `GET /lots/{id}/events` returns the full lifecycle audit trail in chronological order (quarantine, release, and scrap entries from `lot_events`); `GET /orders/{id}/lots` returns the lots consumed to fill an order, with per-lot `quantityConsumed` aggregated via `GROUP BY` across multiple allocation runs — returns an empty list (not 404) for orders filled from the fallthrough on-hand path, and reflects the lot's current status at query time; `GET /skus/{id}/lots/snapshot` returns a live inventory picture — `on_hand`, a per-status aggregate summary (`lotCount`, `totalAvailableQty`), and the full individual lot list newest-received-first — sent in a single round trip via `QueryMultipleAsync` across three `SELECT` statements
 - **SKU Catalog** — create SKUs with initial on-hand quantity; paginated list ordered by SKU code; get by ID
 - **Inventory Adjustments** — signed delta adjustments with mandatory reason text; full audit trail in `inventory_adjustments`; optimistic concurrency on adjust with 409 on version conflict
 - **Availability Query** — `GET /skus/{id}/availability` returns `on_hand`, `reserved`, and `available = on_hand - reserved` in one read
@@ -135,7 +136,7 @@ MaterialAllocationApi/
 ├── appsettings.json                        # Connection strings, Serilog, ReservationExpiry, OutboxRelay, Authentication
 ├── Controllers/
 │   ├── SkusController.cs                   # [warehouse-ops] create, adjust; any-auth get, list, availability
-│   ├── LotsController.cs                   # [warehouse-ops] POST skus/{skuId}/lots, POST lots/{id}/quarantine|release|scrap; any-auth GET skus/{skuId}/lots, GET lots/{id}
+│   ├── LotsController.cs                   # [warehouse-ops] POST skus/{skuId}/lots, POST lots/{id}/quarantine|release|scrap; any-auth GET skus/{skuId}/lots, GET lots/{id}, GET lots/{id}/allocations, GET lots/{id}/events, GET orders/{orderId}/lots, GET skus/{skuId}/lots/snapshot
 │   ├── OrdersController.cs                 # [sales-ops] create, cancel; [allocation-manager] allocate, reserve; any-auth get, list, events
 │   ├── CustomersController.cs              # [sales-ops] create; any-auth get, list
 │   ├── ContractsController.cs              # [sales-ops] create; any-auth list, utilization; nested under /customers/{id}/contracts
@@ -172,14 +173,14 @@ MaterialAllocationApi/
 │   ├── CustomerRecords.cs                  # CreateCustomerRequest / CustomerResponse
 │   ├── ContractRecords.cs                  # CreateContractRequest / ContractResponse / ContractUtilizationResponse
 │   ├── AllocationRecords.cs                # AllocationResponse / AllocationLineResult (+ ThisRunQty=0, LotAllocations=null) / LotAllocationDetail(LotId, LotCode, QuantityConsumed) / AvailabilityResponse / AllocationRunResponse / AllocationRunResult / AllocationEventResponse / AllocationRunAcceptedResponse / AllocationRunStatusResponse / AllocationRunSummary / EnqueueResult (discriminated union)
-│   ├── LotRecords.cs                       # ReceiveLotRequest (LotCode, Quantity, ReceivedAt?) / LotResponse / LotStatusTransitionRequest (Notes?)
+│   ├── LotRecords.cs                       # ReceiveLotRequest (LotCode, Quantity, ReceivedAt?) / LotResponse / LotStatusTransitionRequest (Notes?) / LotAllocationHistoryEntry / LotEventHistoryEntry / OrderLotProvenanceEntry / LotStatusSummary / LotSnapshotEntry / SkuLotSnapshotResponse
 │   ├── ReservationRecords.cs               # ReserveRequest / ReservationResponse / ReservationLineResult
 │   ├── RollupRecords.cs                    # SkuShortageResponse
 │   └── AuthRecords.cs                      # TokenRequest / TokenResponse
 ├── Services/
 │   ├── Interfaces/
 │   │   ├── ISkuService.cs
-│   │   ├── ILotService.cs                  # ReceiveAsync, GetByIdAsync, ListBySkuAsync, QuarantineAsync, ReleaseAsync, ScrapAsync
+│   │   ├── ILotService.cs                  # ReceiveAsync, GetByIdAsync, ListBySkuAsync, QuarantineAsync, ReleaseAsync, ScrapAsync, GetAllocationsAsync, GetEventsAsync, GetOrderLotsAsync, GetSkuSnapshotAsync
 │   │   ├── ICustomerService.cs             # CreateAsync, GetByIdAsync, ListAsync
 │   │   ├── IContractService.cs             # CreateAsync, ListAsync, GetUtilizationAsync
 │   │   ├── IOrderService.cs
@@ -190,7 +191,7 @@ MaterialAllocationApi/
 │   │   ├── IEventPublisher.cs              # PublishAsync(OutboxMessage) — implemented by LoggingEventPublisher
 │   │   └── ITokenService.cs                # IssueToken(role) — implemented by JwtTokenService
 │   ├── SkuService.cs                       # Create, GetById, List, AdjustAsync (optimistic concurrency)
-│   ├── LotService.cs                       # ReceiveAsync (EF write: lot insert + sku.on_hand increment + outbox in one TX); QuarantineAsync, ReleaseAsync, ScrapAsync (EF write: FOR UPDATE on SKU then lot, domain method, LotEvent + outbox in one TX); GetByIdAsync, ListBySkuAsync (Dapper reads)
+│   ├── LotService.cs                       # ReceiveAsync (EF write: lot insert + sku.on_hand increment + outbox in one TX); QuarantineAsync, ReleaseAsync, ScrapAsync (EF write: FOR UPDATE on SKU then lot, domain method, LotEvent + outbox in one TX); GetByIdAsync, ListBySkuAsync, GetAllocationsAsync, GetEventsAsync, GetOrderLotsAsync, GetSkuSnapshotAsync (Dapper reads; GetSkuSnapshotAsync uses QueryMultipleAsync for one round trip)
 │   ├── CustomerService.cs                  # CreateAsync (EF write + unique-violation guard); GetByIdAsync, ListAsync (Dapper reads)
 │   ├── ContractService.cs                  # CreateAsync (customer/SKU existence + overlap guard, EF write, Dapper query-by-id); ListAsync; GetUtilizationAsync (live floor/ceiling vs allocated for current-date active contracts)
 │   ├── OrderService.cs                     # Create (+ customer FK validation), GetById (LEFT JOIN customers), List (+ customerId filter), CancelAsync (TX + FOR UPDATE on SKUs then lots in id-asc order; reads allocation_events to restore lot quantities via Lot.Restore()); emits AllocationReleased events + outbox
@@ -246,7 +247,7 @@ MaterialAllocationApi.Tests/
 │                                           # CreateContractAsync, CreateLotAsync, SubmitAllocationRunAsync, PollRunUntilCompleteAsync,
 │                                           # TriggerAllocationWorkerAsync); DB assertion helpers (GetOnHandAsync, GetLotAvailableQtyAsync,
 │                                           # GetLotStatusAsync); AuthorizeAs(roles) / AuthorizeAsAll() role-header helpers
-├── LotTests.cs                             # 26 tests: lot intake (201+fields+on_hand, two-lot accumulation, unknown SKU 404, duplicate lotCode 422, zero/negative qty 422, receivedAt defaults/preserved); list (paginated+ordered by receivedAt DESC, status filter, unknown SKU 404); get by ID (all fields match, unknown ID 404); quarantine (decrements on_hand, optional notes, 409 already-quarantined, 409 scrapped, 404 unknown); release (restores on_hand exactly, 409 available, 409 scrapped); scrap (zeroes available_qty+on_hand, scrapping quarantined lot leaves on_hand unchanged, 409 already-scrapped, optional notes); full lifecycle round-trip (quarantine→release→scrap invariant over two lots); concurrency (two parallel quarantine requests — one 200, one 409, on_hand = 0)
+├── LotTests.cs                             # 45 tests: lot intake (201+fields+on_hand, two-lot accumulation, unknown SKU 404, duplicate lotCode 422, zero/negative qty 422, receivedAt defaults/preserved); list (paginated+ordered by receivedAt DESC, status filter, unknown SKU 404); get by ID (all fields match, unknown ID 404); quarantine (decrements on_hand, optional notes, 409 already-quarantined, 409 scrapped, 404 unknown); release (restores on_hand exactly, 409 available, 409 scrapped); scrap (zeroes available_qty+on_hand, scrapping quarantined lot leaves on_hand unchanged, 409 already-scrapped, optional notes); full lifecycle round-trip (quarantine→release→scrap invariant over two lots); concurrency (two parallel quarantine requests — one 200, one 409, on_hand = 0); 9a lot allocation history (entry per event, empty when never allocated, paginated, 404 unknown lot); 9b lot event history (quarantine+release in chronological order with notes and quantityAffected, empty fresh lot, scrap appears, 404 unknown lot); 9c order lot provenance (all lots consumed across two-lot FIFO order, empty for fallthrough on-hand order, aggregates qty for same lot, 404 unknown order, reflects current lot status); 9d SKU lot snapshot (aggregate summary per status, lots newest-received-first, includes depleted lots, empty summary+lots for SKU with no lots, 404 unknown SKU)
 ├── LotAllocationTests.cs                   # 12 tests — lot-aware allocation (8a-i..vi): single-lot partial consumption (LotAllocations populated, availableQty decremented); multi-lot FIFO span (oldest consumed first, correct per-lot breakdown); FIFO by received_at not insert order; lot transitions to Depleted when fully consumed; partial allocation when lots insufficient; LotAllocations sums correctly; fallthrough path — SKU with no lots returns null LotAllocations; cancellation restores lot quantities (8c-i..iii): cancel restores availableQty, Depleted→Available on cancel, multi-lot cancel restores all; priority run FIFO preserved across critical/standard orders (8d-i); concurrent allocations on same lot — conservation invariant (on_hand + total_allocated = lot qty) (8e-i)
 ├── CustomerTests.cs                        # 11 tests: customer CRUD (create, duplicate 422, get by ID, 404, paginated list); order linkage (valid/null/invalid customerId, list filter, summary customerCode, allocate→cancel cycle with customerId preserved)
 ├── ContractTests.cs                        # 16 tests: contract CRUD (201+all fields, 403 RBAC, 404 unknown customer/SKU, 422 negative floor/ceiling-below-floor/date-inversion/overlap); list (empty, two-contract, 404); utilization (zero before orders, post-allocation qty, 404); allocation run (ceiling enforced across multiple orders, floor guaranteed before unconstrained customers)
@@ -469,6 +470,10 @@ Returns 409 if a concurrent modification races this request (`version` mismatch)
 | POST | `/lots/{id}/quarantine` | `warehouse-ops` | Place a lot under quality hold; removes units from `on_hand` |
 | POST | `/lots/{id}/release` | `warehouse-ops` | Release a quarantined lot back to available; restores units to `on_hand` |
 | POST | `/lots/{id}/scrap` | `warehouse-ops` | Permanently scrap a lot; irreversible |
+| GET | `/lots/{id}/allocations` | any-auth | Paginated history of allocation events that consumed from this lot |
+| GET | `/lots/{id}/events` | any-auth | Full lifecycle event history for a lot (quarantine, release, scrap) |
+| GET | `/orders/{orderId}/lots` | any-auth | Lots consumed to fill an order, with quantities and current lot status |
+| GET | `/skus/{skuId}/lots/snapshot` | any-auth | Live lot inventory snapshot for a SKU |
 
 **POST `/skus/{skuId}/lots` body:**
 
@@ -509,6 +514,93 @@ All three transition endpoints lock the SKU row first then the lot row (`FOR UPD
 | `status` | string | `available`, `quarantined`, `depleted`, or `scrapped` |
 | `receivedAt` | DateTime | UTC timestamp of physical receipt |
 | `createdAt` | DateTime | UTC timestamp the record was created |
+
+**GET `/lots/{id}/allocations` query params:**
+
+| Param | Default | Description |
+|---|---|---|
+| `page` | 1 | Page number (1-based) |
+| `pageSize` | 20 | Items per page (max 100) |
+
+Returns a `PagedResult<LotAllocationHistoryEntry>`. Each entry is one `allocation_committed` event row — an order allocated in multiple runs against the same lot appears once per run. Returns an empty page (not 404) when the lot exists but has never been allocated against.
+
+`LotAllocationHistoryEntry` fields:
+
+| Field | Type | Description |
+|---|---|---|
+| `orderId` | Guid | The order that consumed from this lot |
+| `referenceCode` | string | Order reference code |
+| `priority` | string | `standard`, `high`, or `critical` |
+| `orderStatus` | string | Current order status |
+| `orderLineId` | Guid | The specific order line |
+| `quantityConsumed` | int | Units taken from this lot in this event |
+| `occurredAt` | DateTime | UTC timestamp of the event |
+
+**GET `/lots/{id}/events` response:**
+
+Returns `IReadOnlyList<LotEventHistoryEntry>` in chronological (`occurredAt` ascending) order. Not paginated — a lot's lifecycle event count is bounded and small.
+
+`LotEventHistoryEntry` fields:
+
+| Field | Type | Description |
+|---|---|---|
+| `eventType` | string | `quarantined`, `released`, or `scrapped` |
+| `quantityAffected` | int | `on_hand` impact (0 when scrapping from `quarantined` state) |
+| `notes` | string? | Operator-provided reason from the transition request |
+| `occurredAt` | DateTime | UTC timestamp |
+
+Returns an empty list (not 404) when the lot exists but has no status transitions yet. Returns 404 if the lot does not exist.
+
+**GET `/orders/{orderId}/lots` response:**
+
+Returns `IReadOnlyList<OrderLotProvenanceEntry>` ordered by `skuCode`, then `receivedAt`. Returns an empty list (not 404) when the order exists but was filled from fallthrough on-hand inventory (no `allocation_committed` events carry a `lot_id` for this order). `quantityConsumed` is the sum across all `allocation_committed` events for this order and lot — multiple allocation runs against the same lot accumulate.
+
+`OrderLotProvenanceEntry` fields:
+
+| Field | Type | Description |
+|---|---|---|
+| `lotId` | Guid | Lot ID |
+| `lotCode` | string | Physical batch identifier |
+| `skuId` | Guid | SKU the lot belongs to |
+| `skuCode` | string | SKU code |
+| `quantityConsumed` | int | Total units from this lot allocated to this order (aggregated across all runs) |
+| `lotStatus` | string | Current lot status (reflects state at query time, not at allocation time) |
+| `receivedAt` | DateTime | UTC timestamp of physical receipt |
+
+Returns 404 if the order does not exist.
+
+**GET `/skus/{skuId}/lots/snapshot` response:**
+
+`SkuLotSnapshotResponse` fields:
+
+| Field | Type | Description |
+|---|---|---|
+| `skuId` | Guid | SKU ID |
+| `skuCode` | string | SKU code |
+| `onHand` | int | Current on-hand quantity from `skus.on_hand` |
+| `summary` | array | Per-status aggregate entries (see below); empty if no lots exist for this SKU |
+| `lots` | array | All lots for this SKU, ordered `receivedAt` descending; empty if no lots exist |
+
+`LotStatusSummary` (per `summary` entry):
+
+| Field | Type | Description |
+|---|---|---|
+| `status` | string | `available`, `quarantined`, `depleted`, or `scrapped` |
+| `lotCount` | int | Number of lots in this status group |
+| `totalAvailableQty` | int | Sum of `available_qty` across lots in this group (0 for `depleted` and `scrapped`) |
+
+`LotSnapshotEntry` (per `lots` entry):
+
+| Field | Type | Description |
+|---|---|---|
+| `lotId` | Guid | Lot ID |
+| `lotCode` | string | Physical batch identifier |
+| `quantity` | int | Total units received — immutable |
+| `availableQty` | int | Units currently available to allocate or hold |
+| `status` | string | `available`, `quarantined`, `depleted`, or `scrapped` |
+| `receivedAt` | DateTime | UTC timestamp of physical receipt |
+
+Returns 404 if the SKU does not exist.
 
 **Status codes:**
 
@@ -1173,3 +1265,4 @@ On first startup, 5 representative memory and NAND SKUs are seeded automatically
 | 18 | Lot-level inventory intake — `lots` table with `lot_code` (unique), `quantity` (immutable), `available_qty` (mutable), `status` (`available`\|`quarantined`\|`depleted`\|`scrapped`), `received_at`, `created_at`; three CHECK constraints (`quantity > 0`, `available_qty >= 0`, `available_qty <= quantity`); `idx_lots_lot_code` unique index; `idx_lots_sku_status_received` composite index pre-built for Phase 20 FIFO query; `Lot` entity with private EF constructor; `LotStatus` enum with `ToDbString`/`FromDbString` extensions; `Sku.ReceiveLot(qty)` increments `on_hand` (semantically distinct from `ReleaseUnits`); `Sku.Lots` navigation collection; `ILotService` / `LotService` (`ReceiveAsync` — EF write: lot insert + on_hand increment + outbox in one `SaveChangesAsync`; `GetByIdAsync`, `ListBySkuAsync` — Dapper reads); `LotsController` (`POST [warehouse-ops]` intake, `GET` list by SKU with optional status filter, `GET` by ID); `LotRecords.cs` (`ReceiveLotRequest`, `LotResponse`); `ApiFixture.ResetDatabaseAsync` updated to delete `lots` before `skus` (RESTRICT FK); 13 integration tests covering intake (201+on_hand increment, two-lot accumulation, 404 unknown SKU, 422 duplicate lotCode, 422 zero/negative qty, receivedAt defaults/preserved), list, and get-by-ID | Done |
 | 19 | Lot status lifecycle — `lot_events` table (`lot_id`, `sku_id`, `event_type` (`quarantined`\|`released`\|`scrapped`), `quantity_affected`, `notes`, `occurred_at`); FK RESTRICT on both `lots` and `skus` (immutable audit ledger); `idx_lot_events_lot_id` + `idx_lot_events_sku_id` indexes; `LotEvent` entity; `LotEventType` enum with `ToDbString`/`FromDbString` extensions; `Lot.Quarantine()`, `Lot.Release()`, `Lot.Scrap()` domain methods returning `on_hand` delta; `Sku.HoldForQuarantine(qty)`, `Sku.RestoreFromQuarantine(qty)` methods (semantically distinct from `AllocateUnits`/`ReleaseUnits`); `ILotService.QuarantineAsync`, `ReleaseAsync`, `ScrapAsync`; `LotService` implements all three with the same lock-order pattern as Phase 4 (`FOR UPDATE` on SKU first, then lot), domain method call, conditional `sku.HoldForQuarantine` / `sku.RestoreFromQuarantine`, `LotEvent` insert, outbox message, single `SaveChangesAsync` + commit; `ConflictException` mapped from `InvalidOperationException` on invalid status transition; pre-flight existence check uses `AnyAsync` (not `FindAsync`) to avoid loading the entity into EF's identity map — prevents stale-cached status from bypassing the `InvalidOperationException` guard under concurrent requests; `LotsController` adds three `POST lots/{id}/quarantine|release|scrap` endpoints (`[warehouse-ops]`); `LotStatusTransitionRequest` (optional `Notes`) added to `LotRecords.cs`; `ApiFixture.ResetDatabaseAsync` updated to delete `lot_events` before `lots`; 13 new integration tests covering quarantine (on_hand decrement, notes, 409 already-quarantined, 409 scrapped, 404 unknown), release (on_hand restore, 409 available, 409 scrapped), scrap (available zeroes on_hand, quarantined leaves on_hand unchanged, 409 already-scrapped, notes), full lifecycle round-trip, and concurrent quarantine (one 200, one 409) | Done |
 | 20 | Lot-aware allocation — `Lot.Consume(qty)` and `Lot.Restore(qty)` domain methods; `AllocationEvent.LotId` nullable FK (migration `20260529034714_AddLotIdToAllocationEvents`, partial index `idx_allocation_events_lot_id WHERE lot_id IS NOT NULL`); `AllocationDbContext` updated with `lot_id` column mapping, FK RESTRICT to `lots`, and partial index; `LotAllocationDetail(LotId, LotCode, QuantityConsumed)` record; `AllocationLineResult` gains nullable `LotAllocations` list; `AllocateAsync` lot lock query (`SELECT * FROM lots WHERE sku_id = ANY(@ids) AND status = 'available' ORDER BY id FOR UPDATE`) added after SKU lock; line loop replaced with lot-aware path (FIFO walk by `received_at`, `Consume`, per-lot `AllocationEvent`) and fallthrough path (SKUs with no Available lots — unchanged pre-Phase-18 behaviour); `OrderService.CancelAsync` slow path reads `allocation_committed` events with non-null `lot_id`, locks lots `FOR UPDATE` in `id` ascending order, calls `lot.Restore(qty)` on each — `Depleted` lots transition back to `Available`; `ApiFixture.ResetDatabaseAsync` updated to delete `allocation_events` before `lots` (RESTRICT FK); `AllocationTestBase` gains `CreateLotAsync`, `GetLotAvailableQtyAsync`, `GetLotStatusAsync` helpers; `LotAllocationTests.cs` — 12 new integration tests: single-lot partial, multi-lot FIFO span, FIFO by `received_at` not insert order, depleted-on-full-consume, partial when lots insufficient, per-lot breakdown sums, fallthrough null `LotAllocations`, cancel restores qty, cancel transitions Depleted→Available, cancel spanning multiple lots, FIFO preserved across priority run, concurrent allocation conservation invariant | Done |
+| 21 | Lot traceability queries — four read-only Dapper endpoints over the lot lineage data written by Phases 18–20; no schema changes, no new entities, no migration; `LotAllocationHistoryEntry`, `LotEventHistoryEntry`, `OrderLotProvenanceEntry`, `LotStatusSummary`, `LotSnapshotEntry`, `SkuLotSnapshotResponse` records added to `LotRecords.cs`; `ILotService` gains `GetAllocationsAsync` (paginated `allocation_committed` events per lot, served by `idx_allocation_events_lot_id` partial index), `GetEventsAsync` (chronological `lot_events` audit trail, unpaginated), `GetOrderLotsAsync` (`GROUP BY lot` + `SUM(quantity)::INT` to aggregate across multi-run allocations; `FirstOrDefaultAsync` for order existence check; empty list for fallthrough-path orders), `GetSkuSnapshotAsync` (three-`SELECT` `QueryMultipleAsync` returning SKU header, per-status summary, and full lot list in one round trip); `LotsController` gains `GET lots/{id}/allocations`, `GET lots/{id}/events`, `GET orders/{orderId}/lots`, `GET skus/{skuId}/lots/snapshot`; 18 integration tests in `LotTests.cs` sections 9a–9d | Done |
