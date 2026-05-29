@@ -73,4 +73,43 @@ public class Lot
 
         return onHandImpact; // caller decrements sku.OnHand by this amount (may be 0)
     }
+
+    public void Consume(int quantity)
+    {
+        if(quantity <= 0)
+            throw new ArgumentOutOfRangeException(nameof(quantity), "Quantity must be positive");
+
+        if(Status != LotStatus.Available)
+            throw new InvalidOperationException(
+                $"Cannot consume from a {Status.ToDbString()} lot"
+            );
+
+        if(AvailableQty < quantity)
+            throw new InvalidOperationException(
+                $"Cannot consume {quantity} units from lot{LotCode} only {AvailableQty} available."
+            );
+        
+        AvailableQty -= quantity;
+
+        if(AvailableQty == 0)
+            Status = LotStatus.Depleted;
+    }
+
+    public void Restore(int quantity)
+    {
+        if(quantity <= 0)
+            throw new ArgumentOutOfRangeException(nameof(quantity), "Quantity must be positive.");
+        
+        if(Status == LotStatus.Quarantined)
+            throw new InvalidOperationException(
+                "Cannot restore units to a quarantined lot - release it first."
+            );
+        if(Status == LotStatus.Scrapped)
+            throw new InvalidOperationException("Cannot restore units to a scrapped lot.");
+
+        AvailableQty += quantity;
+
+        if(Status == LotStatus.Depleted)
+            Status = LotStatus.Available;
+    }
 }

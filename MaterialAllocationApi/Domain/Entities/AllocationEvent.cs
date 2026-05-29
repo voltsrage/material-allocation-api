@@ -6,6 +6,7 @@ public class AllocationEvent
     public Guid OrderLineId { get; private set; }
     public Guid SkuId { get; private set; }
     public int Quantity { get; private set; }
+    public Guid? LotId {get; private set;}
     public DateTimeOffset OccurredAt { get; private set; }
 
     private AllocationEvent() {}
@@ -15,7 +16,8 @@ public class AllocationEvent
         Guid orderId,
         Guid orderLineId,
         Guid skuId,
-        int quantity
+        int quantity,
+        Guid? lotId = null
     )
     {
         EventType = eventType;
@@ -23,6 +25,7 @@ public class AllocationEvent
         OrderLineId = orderLineId;
         SkuId = skuId;
         Quantity = quantity;
+        LotId = lotId;
         OccurredAt = DateTimeOffset.UtcNow;
     }
 }

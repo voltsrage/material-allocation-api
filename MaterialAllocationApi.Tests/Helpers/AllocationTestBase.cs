@@ -248,4 +248,32 @@ public abstract class AllocationTestBase : IAsyncLifetime
         var body = await response.Content.ReadFromJsonAsync<ApiResponse<ContractResponse>>();
         return body!.Data!;
     }
+
+    protected async Task<LotResponse> CreateLotAsync(Guid skuId, string lotCode, int quantity,
+    DateTimeOffset? receivedAt = null)
+    {
+        var body = receivedAt.HasValue
+            ? (object)new { lotCode, quantity, receivedAt }
+            : new { lotCode, quantity };
+
+        var response = await Client.PostAsJsonAsync($"/api/v1/skus/{skuId}/lots", body);
+        response.EnsureSuccessStatusCode();
+        return await ReadAsync<LotResponse>(response);
+    }
+
+    protected async Task<int> GetLotAvailableQtyAsync(Guid lotId)
+    {
+        await using var conn = new NpgsqlConnection(Fixture.GetConnectionString());
+        await conn.OpenAsync();
+        return await conn.ExecuteScalarAsync<int>(
+            "SELECT available_qty FROM lots WHERE id = @id", new { id = lotId });
+    }
+
+    protected async Task<string> GetLotStatusAsync(Guid lotId)
+    {
+        await using var conn = new NpgsqlConnection(Fixture.GetConnectionString());
+        await conn.OpenAsync();
+        return await conn.ExecuteScalarAsync<string>(
+            "SELECT status FROM lots WHERE id = @id", new { id = lotId });
+    }
 }

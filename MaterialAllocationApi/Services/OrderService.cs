@@ -1,6 +1,7 @@
 
 using Dapper;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Storage;
 using Npgsql;
 
 public class OrderService : IOrderService
@@ -92,6 +93,42 @@ public class OrderService : IOrderService
                     "SELECT * FROM skus WHERE id = ANY(@ids) ORDER BY id FOR UPDATE",
                     new NpgsqlParameter("ids", skuIds)
                 ).ToListAsync();
+
+            var conn = (NpgsqlConnection) _db.Database.GetDbConnection();
+            var dbTx = (NpgsqlTransaction) tx.GetDbTransaction();
+
+            var lotConsumptions = (await conn.QueryAsync<(Guid LotId, int TotalQty)>(
+                @"
+                SELECT
+                    lot_id as LotId, SUM(quantity) as TotalQty
+                FROM allocation_events
+                WHERE order_id = @orderId
+                    AND event_type = 'allocation_committed'
+                    AND lot_id IS NOT NULL
+                GROUP by lot_id
+                ",
+                new {orderId = id},
+                transaction: dbTx
+            )).ToList();
+
+            if(lotConsumptions.Count > 0)
+            {
+                var lotIds = lotConsumptions.Select(lc => lc.LotId).ToArray();
+
+                var lotsToRestore = await _db.Lots
+                    .FromSqlRaw(
+                        "SELECT * FROM lots WHERE id = ANY(@ids) ORDER BY id FOR UPDATE",
+                        new NpgsqlParameter("ids", lotIds)
+                    ).ToListAsync(ct);
+
+                var lotMap = lotsToRestore.ToDictionary(l => l.Id);
+
+                foreach(var (lotId, totalQty) in lotConsumptions)
+                {
+                    if(lotMap.TryGetValue(lotId, out var lot))
+                        lot.Restore(totalQty);
+                }
+            }
 
             // 6. Release each allocated line.
             // Read allocated_qty from the tracked entity - safe because the FOR UPDATE

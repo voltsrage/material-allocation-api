@@ -158,6 +158,7 @@ public class AllocationDbContext : DbContext
             b.Property(x => x.OrderLineId).HasColumnName("order_line_id").IsRequired();
             b.Property(x => x.SkuId).HasColumnName("sku_id").IsRequired();
             b.Property(x => x.Quantity).HasColumnName("quantity").IsRequired();
+            b.Property(x => x.LotId).HasColumnName("lot_id");
             b.Property(x => x.OccurredAt).HasColumnName("occurred_at").IsRequired();
 
             // RESTRICT: prevents deleting an order or line that has audit history.
@@ -169,12 +170,23 @@ public class AllocationDbContext : DbContext
             b.HasOne<Sku>().WithMany().HasForeignKey(x => x.SkuId)
                 .OnDelete(DeleteBehavior.Restrict);
 
+            b.HasOne<Lot>().WithMany().HasForeignKey(x => x.LotId)
+                .OnDelete(DeleteBehavior.Restrict)
+                .IsRequired(false);
+
             // Primary query pattern: load the full event history for one order
             b.HasIndex(x => x.OrderId).HasDatabaseName("idx_allocation_events_order_id");
             // Secondary: audit queries filtering by SKU across all orders
             b.HasIndex(x => x.SkuId).HasDatabaseName("idx_allocation_events_sku_id");
             // Chronological reporting queries
             b.HasIndex(x => x.OccurredAt).HasDatabaseName("idx_allocation_events_occurred_at");
+
+            // Partial index: only rows with a lot_id are indexed.
+            // Serves Phase 21's query "which orders consumed from lot X?"
+            // Kept small because most historical events (reservation, cancel) have no lot_id.
+            b.HasIndex(x => x.LotId)
+                .HasFilter("lot_id IS NOT NULL")
+                .HasDatabaseName("idx_allocation_events_lot_id");
         });
 
         modelBuilder.Entity<OutboxMessage>(b =>

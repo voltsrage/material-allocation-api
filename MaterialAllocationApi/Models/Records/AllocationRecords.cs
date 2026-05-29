@@ -1,12 +1,17 @@
 using Microsoft.AspNetCore.Mvc;
 
+/*
+`LotAllocations` is `null` for SKUs without lots (fallthrough path) and `null` when `canAllocate == 0`. 
+It is populated only when the lot-aware path runs and at least one lot is consumed. The `= null` default preserves positional compatibility with all existing construction sites.
+*/
 public record AllocationLineResult(
     Guid SkuId,
     string SkuCode,
     int RequestedQty,
     int AllocatedQty, // total allocated across all runs (cumulative, not just this run)
     int RemainingQty, // RequestedQty - AllocatedQty after this run
-    int ThisRunQty = 0 // units allocated in this specific AllocateAsync call
+    int ThisRunQty = 0, // units allocated in this specific AllocateAsync call
+    IReadOnlyList<LotAllocationDetail>? LotAllocations = null
 );
 
 public record AllocationResponse(
@@ -93,3 +98,5 @@ public record EnqueueResult
         _ => throw new InvalidOperationException()
     };
 }
+
+public record LotAllocationDetail(Guid LotId, string LotCode, int QuantityConsumed);

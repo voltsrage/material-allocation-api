@@ -101,8 +101,12 @@ public class LotService : ILotService
     public async Task<LotResponse> QuarantineAsync(Guid id, string? notes, CancellationToken ct = default)
     {
         // Pre-flight: verify existence outside the transaction to avoid locking for missing lots.
-        _ = await _db.Lots.FindAsync([id], ct)
-            ?? throw new NotFoundException($"Lot {id} not found.");
+        // AnyAsync (not FindAsync) so the entity is NOT loaded into the identity map — if FindAsync
+        // were used, EF Core would return the stale tracked entity inside the transaction instead of
+        // the fresh DB row locked by FOR UPDATE, causing a concurrent quarantine to see stale
+        // status=available and drive on_hand negative via HoldForQuarantine.
+        if (!await _db.Lots.AnyAsync(l => l.Id == id, ct))
+            throw new NotFoundException($"Lot {id} not found.");
 
         await using var tx = await _db.Database.BeginTransactionAsync(ct);
 
@@ -211,8 +215,8 @@ public class LotService : ILotService
     public async Task<LotResponse> ReleaseAsync(Guid id, string? notes, CancellationToken ct = default)
     {
         // Pre-flight: verify existence outside the transaction to avoid locking for missing lots.
-        _ = await _db.Lots.FindAsync([id], ct)
-            ?? throw new NotFoundException($"Lot {id} not found.");
+        if (!await _db.Lots.AnyAsync(l => l.Id == id, ct))
+            throw new NotFoundException($"Lot {id} not found.");
 
         await using var tx = await _db.Database.BeginTransactionAsync(ct);
 
@@ -283,8 +287,8 @@ public class LotService : ILotService
     public async Task<LotResponse> ScrapAsync(Guid id, string? notes, CancellationToken ct = default)
     {
         // Pre-flight: verify existence outside the transaction to avoid locking for missing lots.
-        _ = await _db.Lots.FindAsync([id], ct)
-            ?? throw new NotFoundException($"Lot {id} not found.");
+        if (!await _db.Lots.AnyAsync(l => l.Id == id, ct))
+            throw new NotFoundException($"Lot {id} not found.");
 
         await using var tx = await _db.Database.BeginTransactionAsync(ct);
 

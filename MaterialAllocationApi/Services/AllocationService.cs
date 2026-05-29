@@ -75,6 +75,24 @@ public class AllocationService : IAllocationService
             var conn = (NpgsqlConnection)_db.Database.GetDbConnection();
             var dbTx = (NpgsqlTransaction)tx.GetDbTransaction();
 
+            // Lock Available lot rows for the SKUs in this order, in ascending id order
+            // Ascending id order is consistent with the SKU lock order - prevents circular waits
+            // if a future operation ever locks lots across multiple transactions simultaneously
+            // Consumption order(FIFO by received_at) is applied after locking not during
+            var lotsIds_param = skuIds; // same Ngpsl parameter as the SKU lock query
+            var lots = await _db.Lots
+                .FromSqlRaw(
+                    "SELECT * FROM lots where sku_id = ANY(@ids) AND status = 'available' ORDER BY id FOR UPDATE",
+                    new NpgsqlParameter("ids", skuIds)
+                ).ToListAsync(ct);
+
+            // Group lots by SKU. Sort each group by received_at ASC for FIFO consumption
+
+            // The lock was acquired in id order; consumption order is a separate concern
+            var lotsBySku = lots
+                .GroupBy(l => l.SkuId)
+                .ToDictionary(g => g.Key, g => g.OrderBy(l => l.ReceivedAt).ToList());
+
             var reservedRows = await conn.QueryAsync<(Guid SkuId, int Reserved)>
             (
                 @"
@@ -105,32 +123,98 @@ public class AllocationService : IAllocationService
                 var remaining = line.RequestedQty - line.AllocatedQty;
 
                 var othersHeld = reservedByOthers.GetValueOrDefault(sku.Id);
-                var available = Math.Max(0, sku.OnHand - othersHeld);
+
+                lotsBySku.TryGetValue(line.SkuId, out var lotsForSku);
+
+                var hasLots = lotsForSku is {Count: > 0};
+
+                // For lot-tracked SKUs, cap available by the lot sum so pre-lot adjust inventory
+                // does not inflate canAllocate beyond what lots can actually provide
+                var available = hasLots
+                ? Math.Max(0, Math.Min(sku.OnHand - othersHeld, lotsForSku!.Sum(l => l.AvailableQty)))
+                : Math.Max(0, sku.OnHand - othersHeld);
+
                 var canAllocate = Math.Min(available, remaining);
 
                 if(skuCapOverrides is not null && skuCapOverrides.TryGetValue(line.SkuId, out var cap))
                     canAllocate = Math.Min(canAllocate, cap);
 
-                if(canAllocate > 0)
+                if(canAllocate <= 0)
                 {
-                    // AllocateUnits decrements on_hand; Allocate increments allocated_qty.
-                    // Both entities are tracked - SaveChangesAsync persists both atomically
+                    results.Add(new AllocationLineResult(
+                        line.SkuId,
+                        sku.SkuCode,
+                        line.RequestedQty,
+                        line.AllocatedQty,
+                        line.RequestedQty - line.AllocatedQty
+                    ));
+                    continue;
+                }
+
+                if(hasLots)
+                {
+                    // Lot-aware path
+                    var lotAllocations = new List<LotAllocationDetail>();
+                    var stillNeeded = canAllocate;
+
+                    foreach(var lot in lotsForSku)
+                    {
+                        if(stillNeeded <= 0) break;
+
+                        var take = Math.Min(lot.AvailableQty, stillNeeded);
+                        lot.Consume(take);
+                        lotAllocations.Add(new LotAllocationDetail(lot.Id, lot.LotCode, take));
+
+                        // On AllocationEvent per lot; LotId is set to so Phase 21 can invert the lookup
+                        _db.AllocationEvents.Add(new AllocationEvent(
+                            AllocationEventType.AllocationCommitted,
+                            orderId, line.Id, line.SkuId, take, lot.Id
+                        ));
+
+                        stillNeeded -= take;
+                    }
+
+                    var totalConsumed = canAllocate - stillNeeded;
+
+                    if(totalConsumed > 0)
+                    {
+                        sku.AllocateUnits(totalConsumed);
+                        line.Allocate(totalConsumed);
+                    }
+
+                    results.Add(new AllocationLineResult(
+                        line.SkuId,
+                        sku.SkuCode,
+                        line.RequestedQty,
+                        line.AllocatedQty,
+                        line.RequestedQty - line.AllocatedQty,
+                        totalConsumed, // ThisRunQty - canAllocate is exactly what was allocated this call
+                        lotAllocations.Count > 0 ? lotAllocations.AsReadOnly() : null
+                    ));
+                }
+                else
+                {
+                    
+                    // Fall through: not lots for this SKU - existing on_hand behavior
                     sku.AllocateUnits(canAllocate);
                     line.Allocate(canAllocate);
 
                     _db.AllocationEvents.Add(new AllocationEvent(
                         AllocationEventType.AllocationCommitted, orderId, line.Id, line.SkuId, canAllocate
                     ));
+                    
+
+                    results.Add(new AllocationLineResult(
+                        line.SkuId,
+                        sku.SkuCode,
+                        line.RequestedQty,
+                        line.AllocatedQty,
+                        line.RequestedQty - line.AllocatedQty,
+                        canAllocate // ThisRunQty - canAllocate is exactly what was allocated this call
+                    ));
                 }
 
-                results.Add(new AllocationLineResult(
-                    line.SkuId,
-                    sku.SkuCode,
-                    line.RequestedQty,
-                    line.AllocatedQty,
-                    line.RequestedQty - line.AllocatedQty,
-                    canAllocate // ThisRunQty - canAllocate is exactly what was allocated this call
-                ));
+                
             }
 
             // 6. Recompute order status from updated line quantities
