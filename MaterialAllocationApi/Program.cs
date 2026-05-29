@@ -56,6 +56,7 @@ try
     builder.Services.AddScoped<IAllocationRunService, AllocationRunService>();
     builder.Services.AddScoped<ICustomerService, CustomerService>(); 
     builder.Services.AddScoped<IContractService, ContractService>();
+    builder.Services.AddScoped<ILotService, LotService>();
 
     builder.Services.Configure<OutboxRelaySettings>(
         builder.Configuration.GetSection("OutboxRelay")

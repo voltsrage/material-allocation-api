@@ -80,6 +80,10 @@ public class ApiFixture : WebApplicationFactory<Program>, IAsyncLifetime
         await db.Database.ExecuteSqlRawAsync("DELETE FROM allocation_events");
         // inventory_adjustments has a RESTRICT FK to skus — must precede skus.
         await db.Database.ExecuteSqlRawAsync("DELETE FROM inventory_adjustments");
+        // lot_events has RESTRICT FKs to lots and skus — must precede both.
+        await db.Database.ExecuteSqlRawAsync("DELETE FROM lot_events");
+        // lots has a RESTRICT FK to skus — must precede skus.
+        await db.Database.ExecuteSqlRawAsync("DELETE FROM lots");
         // order_lines deletion cascades to reservations.
         await db.Database.ExecuteSqlRawAsync("DELETE FROM order_lines");
         await db.Database.ExecuteSqlRawAsync("DELETE FROM orders");

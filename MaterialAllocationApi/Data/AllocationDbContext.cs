@@ -16,6 +16,8 @@ public class AllocationDbContext : DbContext
     public DbSet<AllocationRun> AllocationRuns => Set<AllocationRun>();
     public DbSet<Customer> Customers => Set<Customer>();
     public DbSet<CustomerContract> CustomerContracts => Set<CustomerContract>();
+    public DbSet<Lot> Lots => Set<Lot>();
+    public DbSet<LotEvent> LotEvents => Set<LotEvent>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -282,6 +284,67 @@ public class AllocationDbContext : DbContext
             // enforces this in the service layer — see Step 2b.
             b.HasIndex(x => new { x.CustomerId, x.SkuId })
                 .HasDatabaseName("idx_customer_contracts_customer_sku");
+        });
+
+        modelBuilder.Entity<Lot>(b =>
+        {
+            b.ToTable("lots", t =>
+            {
+                t.HasCheckConstraint("chk_lots_quantity_positive",       "quantity > 0");
+                t.HasCheckConstraint("chk_lots_available_non_negative",  "available_qty >= 0");
+                t.HasCheckConstraint("chk_lots_available_lte_quantity",  "available_qty <= quantity");
+            });
+            b.HasKey(x => x.Id);
+            b.Property(x => x.Id).HasColumnName("id").HasDefaultValueSql("gen_random_uuid()");
+            b.Property(x => x.SkuId).HasColumnName("sku_id").IsRequired();
+            b.Property(x => x.LotCode).HasColumnName("lot_code").HasMaxLength(64).IsRequired();
+            b.Property(x => x.Quantity).HasColumnName("quantity").IsRequired();
+            b.Property(x => x.AvailableQty).HasColumnName("available_qty").IsRequired();
+            b.Property(x => x.Status).HasColumnName("status").HasMaxLength(32).IsRequired()
+                .HasConversion(
+                    v => v.ToDbString(),
+                    v => LotStatusExtensions.FromDbString(v));
+            b.Property(x => x.ReceivedAt).HasColumnName("received_at").IsRequired();
+            b.Property(x => x.CreatedAt).HasColumnName("created_at").IsRequired();
+
+            b.HasOne(x => x.Sku)
+            .WithMany(x => x.Lots)
+            .HasForeignKey(x => x.SkuId)
+            .OnDelete(DeleteBehavior.Restrict);
+
+            // Uniqueness: lot_code is the physical batch identifier — must be unique across the system.
+            b.HasIndex(x => x.LotCode).IsUnique().HasDatabaseName("idx_lots_lot_code");
+
+            // Phase 20's FIFO lot selection query: WHERE sku_id = @skuId AND status = 'available'
+            // ORDER BY received_at ASC. This composite index serves that query without a sort step.
+            b.HasIndex(x => new { x.SkuId, x.Status, x.ReceivedAt })
+            .HasDatabaseName("idx_lots_sku_status_received");
+        });
+
+        modelBuilder.Entity<LotEvent>(b =>
+        {
+            b.ToTable("lot_events");
+            b.HasKey(x => x.Id);
+            b.Property(x => x.Id).HasColumnName("id").HasDefaultValueSql("gen_random_uuid()");
+            b.Property(x => x.LotId).HasColumnName("lot_id").IsRequired();
+            b.Property(x => x.SkuId).HasColumnName("sku_id").IsRequired();
+            b.Property(x => x.EventType).HasColumnName("event_type").HasMaxLength(32).IsRequired()
+                .HasConversion(
+                    v => v.ToDbString(),
+                    v => LotEventTypeExtensions.FromDbString(v));
+            b.Property(x => x.QuantityAffected).HasColumnName("quantity_affected").IsRequired();
+            b.Property(x => x.Notes).HasColumnName("notes").HasMaxLength(500);
+            b.Property(x => x.OccurredAt).HasColumnName("occurred_at").IsRequired();
+
+            b.HasOne<Lot>().WithMany().HasForeignKey(x => x.LotId)
+                .OnDelete(DeleteBehavior.Restrict);
+            b.HasOne<Sku>().WithMany().HasForeignKey(x => x.SkuId)
+                .OnDelete(DeleteBehavior.Restrict);
+
+            // Primary query pattern: load all events for a given lot (Phase 21 traceability endpoint).
+            b.HasIndex(x => x.LotId).HasDatabaseName("idx_lot_events_lot_id");
+            // Secondary: audit queries across all lots for a single SKU.
+            b.HasIndex(x => x.SkuId).HasDatabaseName("idx_lot_events_sku_id");
         });
     }
 }

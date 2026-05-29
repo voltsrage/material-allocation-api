@@ -2,6 +2,7 @@
 using System;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 
@@ -10,9 +11,11 @@ using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 namespace MaterialAllocationApi.Migrations
 {
     [DbContext(typeof(AllocationDbContext))]
-    partial class AllocationDbContextModelSnapshot : ModelSnapshot
+    [Migration("20260528155221_AddLots")]
+    partial class AddLots
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder
@@ -368,52 +371,6 @@ namespace MaterialAllocationApi.Migrations
                         });
                 });
 
-            modelBuilder.Entity("LotEvent", b =>
-                {
-                    b.Property<Guid>("Id")
-                        .ValueGeneratedOnAdd()
-                        .HasColumnType("uuid")
-                        .HasColumnName("id")
-                        .HasDefaultValueSql("gen_random_uuid()");
-
-                    b.Property<string>("EventType")
-                        .IsRequired()
-                        .HasMaxLength(32)
-                        .HasColumnType("character varying(32)")
-                        .HasColumnName("event_type");
-
-                    b.Property<Guid>("LotId")
-                        .HasColumnType("uuid")
-                        .HasColumnName("lot_id");
-
-                    b.Property<string>("Notes")
-                        .HasMaxLength(500)
-                        .HasColumnType("character varying(500)")
-                        .HasColumnName("notes");
-
-                    b.Property<DateTimeOffset>("OccurredAt")
-                        .HasColumnType("timestamp with time zone")
-                        .HasColumnName("occurred_at");
-
-                    b.Property<int>("QuantityAffected")
-                        .HasColumnType("integer")
-                        .HasColumnName("quantity_affected");
-
-                    b.Property<Guid>("SkuId")
-                        .HasColumnType("uuid")
-                        .HasColumnName("sku_id");
-
-                    b.HasKey("Id");
-
-                    b.HasIndex("LotId")
-                        .HasDatabaseName("idx_lot_events_lot_id");
-
-                    b.HasIndex("SkuId")
-                        .HasDatabaseName("idx_lot_events_sku_id");
-
-                    b.ToTable("lot_events", (string)null);
-                });
-
             modelBuilder.Entity("Order", b =>
                 {
                     b.Property<Guid>("Id")
@@ -695,21 +652,6 @@ namespace MaterialAllocationApi.Migrations
                         .IsRequired();
 
                     b.Navigation("Sku");
-                });
-
-            modelBuilder.Entity("LotEvent", b =>
-                {
-                    b.HasOne("Lot", null)
-                        .WithMany()
-                        .HasForeignKey("LotId")
-                        .OnDelete(DeleteBehavior.Restrict)
-                        .IsRequired();
-
-                    b.HasOne("Sku", null)
-                        .WithMany()
-                        .HasForeignKey("SkuId")
-                        .OnDelete(DeleteBehavior.Restrict)
-                        .IsRequired();
                 });
 
             modelBuilder.Entity("Order", b =>

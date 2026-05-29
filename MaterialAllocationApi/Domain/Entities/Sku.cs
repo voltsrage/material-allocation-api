@@ -8,6 +8,7 @@ public class Sku
     public DateTimeOffset UpdatedAt { get; private set; }
 
     public ICollection<InventoryAdjustment> Adjustments { get; private set; } = new List<InventoryAdjustment>();
+    public ICollection<Lot> Lots { get; private set; } = new List<Lot>();
 
     private Sku() {}
 
@@ -52,6 +53,38 @@ public class Sku
         if(quantity <= 0)
             throw new ArgumentOutOfRangeException(nameof(quantity),
             "Quantity must be positive.");
+
+        OnHand += quantity;
+        UpdatedAt = DateTimeOffset.UtcNow;
+    }
+
+    public void ReceiveLot(int quantity)
+    {
+        if(quantity < 0)
+            throw new ArgumentOutOfRangeException(nameof(quantity), "Quantity must be positive");
+
+        OnHand += quantity;
+        UpdatedAt = DateTimeOffset.UtcNow;
+    }
+
+    public void HoldForQuarantine(int quantity)
+    {
+        if(quantity <= 0)
+            throw new ArgumentOutOfRangeException(nameof(quantity), "Quantity must be positive");
+
+        if(OnHand < quantity)
+            throw new InvalidOperationException(
+                $"Cannot quarantine {quantity} units; on_hand is only {OnHand}"
+            );
+        
+        OnHand -= quantity;
+        UpdatedAt = DateTimeOffset.UtcNow;
+    }
+
+    public void RestoreFromQuarantine(int quantity)
+    {
+        if(quantity <= 0)
+            throw new ArgumentOutOfRangeException(nameof(quantity), "Quantity must be positive");
 
         OnHand += quantity;
         UpdatedAt = DateTimeOffset.UtcNow;

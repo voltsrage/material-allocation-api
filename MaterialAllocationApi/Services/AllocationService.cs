@@ -279,6 +279,10 @@ public class AllocationService : IAllocationService
         // across the entire run (floor pass + priority pass combined)
         var ceilingSpent = new Dictionary<(Guid, Guid), int>();
 
+        var ordersByCustomer = openOrders
+            .Where(o => o.CustomerId.HasValue)
+            .GroupBy(o => o.CustomerId!.Value)
+            .ToDictionary(g => g.Key, g => g.ToList());
         /*
         FLOOR PASS: honor contractual minimums before any priority ordering
         For reach active contract, allocate up to floor_qty across the customer's
@@ -288,19 +292,21 @@ public class AllocationService : IAllocationService
         {
             var remainingFloor = contract.FloorQty;
 
-            var customerOrders = openOrders
+            if(!ordersByCustomer.TryGetValue(contract.CustomerId, out var customerOrders))
+                continue;
+
+            var eligibleOrders = customerOrders
                 .Where(o => 
-                    o.CustomerId == contract.CustomerId &&
                     o.Status != OrderStatus.FullyAllocated &&
                     o.Status != OrderStatus.Cancelled &&
                     o.Lines.Any(l => l.SkuId == contract.SkuId)
-                ).ToList(); // inherits the priority + created_at sort from openOrders
+                ); // priority + created_at order already inherited from openOrders
 
-            foreach(var order in customerOrders)
+            foreach(var order in eligibleOrders)
             {
                 if(remainingFloor <= 0) break;
 
-                var skuCap = new Dictionary<Guid,int>{[contract.CustomerId] = remainingFloor};
+                var skuCap = new Dictionary<Guid,int>{[contract.SkuId] = remainingFloor};
 
                 try
                 {
@@ -366,6 +372,8 @@ public class AllocationService : IAllocationService
                     order.Status.ToDbString(),
                     order.Status == OrderStatus.FullyAllocated
                 ));
+
+                continue;
             }
 
             IReadOnlyDictionary<Guid, int>? skuCaps = null;
@@ -421,11 +429,12 @@ public class AllocationService : IAllocationService
         }
 
         var results = resultMap.Values.ToList();
+        var fullyAllocated = results.Count(r => r.IsFullyAllocated);
 
         return new AllocationRunResponse(
             OrdersProcessed: results.Count,
-            OrdersFullyAllocated: results.Count(r => r.IsFullyAllocated),
-            OrdersPartiallyAllocated: results.Count(r => !r.IsFullyAllocated),
+            OrdersFullyAllocated: fullyAllocated,
+            OrdersPartiallyAllocated: results.Count - fullyAllocated,
             Results: results
         );
     }
