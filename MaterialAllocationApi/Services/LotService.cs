@@ -127,7 +127,8 @@ public class LotService : ILotService
                 l.sku_id as SkuId,
                 s.sku_code as SkuCode,
                 SUM(ae.quantity)::INT AS QuantityConsumed,
-                l.status as LotStatus,
+                MIN(ae.lot_status_snapshot) AS LotStatusAtAllocation,
+                l.status as LotStatusNow,
                 l.received_at as ReceivedAt
             FROM allocation_events ae
             JOIN lots l ON l.id = ae.lot_id

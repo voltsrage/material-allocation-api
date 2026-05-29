@@ -52,7 +52,8 @@ public record OrderLotProvenanceEntry
     Guid SkuId,
     string SkuCode,
     int QuantityConsumed,
-    string LotStatus,
+    string? LotStatusAtAllocation, // from allocation_events.lot_status_snapshot; null for pre-phase 22
+    string LotStatusNow, // from lots.status; always current
     DateTime ReceivedAt
 );
 

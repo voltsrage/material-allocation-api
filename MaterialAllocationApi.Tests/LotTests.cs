@@ -623,7 +623,29 @@ public class LotTests(ApiFixture fixture) : AllocationTestBase(fixture)
 
         var provenance = await ReadAsync<IReadOnlyList<OrderLotProvenanceEntry>>(response);
         Assert.Single(provenance);
-        Assert.Equal("quarantined", provenance[0].LotStatus);
+        Assert.Equal("quarantined", provenance[0].LotStatusNow);
+        Assert.Equal("available",   provenance[0].LotStatusAtAllocation);
+    }
+
+    // ── 10a — Lot status snapshot ─────────────────────────────────────────────
+
+    [Fact]
+    public async Task OrderLots_SnapshotCapturesStatusAtAllocationNotCurrentStatus()
+    {
+        var skuId   = await CreateSkuAsync("SNAP-10A-SKU", onHand: 0);
+        var lot     = await CreateLotAsync(skuId, "SNAP-10A-LOT", 100);
+        var orderId = await CreateOrderAsync("SNAP-10A-ORD", skuId, requestedQty: 60);
+        await AllocateAsync(orderId);
+        await QuarantineLotAsync(lot.Id);
+
+        var response = await Client.GetAsync($"/api/v1/orders/{orderId}/lots");
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        var provenance = await ReadAsync<IReadOnlyList<OrderLotProvenanceEntry>>(response);
+        Assert.Single(provenance);
+        Assert.Equal(lot.Id,      provenance[0].LotId);
+        Assert.Equal("available", provenance[0].LotStatusAtAllocation);
+        Assert.Equal("quarantined", provenance[0].LotStatusNow);
     }
 
     // ── 9d — SKU lot snapshot ─────────────────────────────────────────────────

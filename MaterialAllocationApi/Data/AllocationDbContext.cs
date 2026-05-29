@@ -159,6 +159,7 @@ public class AllocationDbContext : DbContext
             b.Property(x => x.SkuId).HasColumnName("sku_id").IsRequired();
             b.Property(x => x.Quantity).HasColumnName("quantity").IsRequired();
             b.Property(x => x.LotId).HasColumnName("lot_id");
+            b.Property(x => x.LotStatusSnapshot).HasColumnName("lot_status_snapshot").HasMaxLength(20);
             b.Property(x => x.OccurredAt).HasColumnName("occurred_at").IsRequired();
 
             // RESTRICT: prevents deleting an order or line that has audit history.

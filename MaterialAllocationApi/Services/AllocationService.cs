@@ -168,7 +168,7 @@ public class AllocationService : IAllocationService
                         // On AllocationEvent per lot; LotId is set to so Phase 21 can invert the lookup
                         _db.AllocationEvents.Add(new AllocationEvent(
                             AllocationEventType.AllocationCommitted,
-                            orderId, line.Id, line.SkuId, take, lot.Id
+                            orderId, line.Id, line.SkuId, take, lot.Id, lotStatusSnapshot: lot.Status.ToDbString()
                         ));
 
                         stillNeeded -= take;

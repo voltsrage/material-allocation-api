@@ -7,6 +7,7 @@ public class AllocationEvent
     public Guid SkuId { get; private set; }
     public int Quantity { get; private set; }
     public Guid? LotId {get; private set;}
+    public string? LotStatusSnapshot {get; private set;}
     public DateTimeOffset OccurredAt { get; private set; }
 
     private AllocationEvent() {}
@@ -17,7 +18,8 @@ public class AllocationEvent
         Guid orderLineId,
         Guid skuId,
         int quantity,
-        Guid? lotId = null
+        Guid? lotId = null,
+        string? lotStatusSnapshot = null
     )
     {
         EventType = eventType;
@@ -26,6 +28,7 @@ public class AllocationEvent
         SkuId = skuId;
         Quantity = quantity;
         LotId = lotId;
+        LotStatusSnapshot = lotStatusSnapshot;
         OccurredAt = DateTimeOffset.UtcNow;
     }
 }
